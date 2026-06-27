@@ -27,7 +27,7 @@ on:
 
 jobs:
   notify:
-    runs-on: ${{ inputs.runs-on }}
+    runs-on: ${{ inputs['runs-on'] }}
     permissions: {}
     steps:
       - name: Send Discord failure notification
