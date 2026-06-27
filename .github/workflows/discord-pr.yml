@@ -1,0 +1,87 @@
+name: PR Discord Notifications
+
+# Reusable workflow. Call it from a repo with:
+#
+#   on:
+#     pull_request:
+#       types: [closed]
+#   jobs:
+#     notify:
+#       uses: plonklabs/.github/.github/workflows/discord-pr.yml@main
+#       secrets: inherit
+#
+# The job reads github.event.pull_request.* from the caller's event.
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: Runner to execute on.
+        type: string
+        default: ubuntu-latest
+    secrets:
+      DISCORD_WEBHOOK:
+        required: true
+
+jobs:
+  notify:
+    runs-on: ${{ inputs.runs-on }}
+    permissions: {}
+    steps:
+      - name: Set event details
+        id: event
+        env:
+          PR_MERGED: ${{ github.event.pull_request.merged }}
+        run: |
+          if [ "$PR_MERGED" = "true" ]; then
+            echo "title=🟣 Pull Request Merged" >> "$GITHUB_OUTPUT"
+            echo "color=7419530" >> "$GITHUB_OUTPUT"
+          else
+            echo "title=🔴 Pull Request Closed" >> "$GITHUB_OUTPUT"
+            echo "color=15158332" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Send Discord notification
+        env:
+          WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_AUTHOR_URL: ${{ github.event.pull_request.user.html_url }}
+          PR_HEAD: ${{ github.event.pull_request.head.ref }}
+          PR_BASE: ${{ github.event.pull_request.base.ref }}
+          EMBED_TITLE: ${{ steps.event.outputs.title }}
+          EMBED_COLOR: ${{ steps.event.outputs.color }}
+        run: |
+          PAYLOAD=$(jq -n \
+            --arg title "$EMBED_TITLE" \
+            --arg url "$PR_URL" \
+            --argjson color "$EMBED_COLOR" \
+            --arg number "$PR_NUMBER" \
+            --arg pr_title "$PR_TITLE" \
+            --arg author "$PR_AUTHOR" \
+            --arg author_url "$PR_AUTHOR_URL" \
+            --arg head "$PR_HEAD" \
+            --arg base "$PR_BASE" \
+            '{
+              username: "GitHub PRs",
+              embeds: [{
+                title: $title,
+                url: $url,
+                color: $color,
+                fields: [
+                  { name: "PR", value: ("#" + $number + " " + $pr_title), inline: false },
+                  { name: "Author", value: ("[" + $author + "](" + $author_url + ")"), inline: true },
+                  { name: "Branch", value: ("`" + $head + "` → `" + $base + "`"), inline: true }
+                ]
+              }]
+            }')
+
+          response=$(curl -s -w "\n%{http_code}" -H "Content-Type: application/json" \
+            -X POST "$WEBHOOK_URL" -d "$PAYLOAD")
+          http_code=$(echo "$response" | tail -1)
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "::warning::Discord webhook returned HTTP $http_code"
+            echo "$response" | head -n -1
+          fi
