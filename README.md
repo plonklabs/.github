@@ -67,10 +67,10 @@ Inputs: `runs-on` (default `ubuntu-latest`), `model` (default `claude-sonnet-4-6
 
 ## Claude skills
 
-`.claude/skills/` holds repo-agnostic Claude Code skills:
+`.claude/skills/` holds Claude Code skills **scoped to this repo** — same archetype as the skills in the other plonklabs repos, but their gates and examples are this repo's (Actions YAML, profile, templates; `actionlint`/markdown validation; squash-merge into protected `main`):
 
-- **`implement`** — execute an agreed-upon stack of PRs autonomously (implement → self-review → ready → bot review + e2e → merge → next).
-- **`spec`** — turn a feature idea into a spec and a tracking epic issue.
+- **`implement`** — execute an agreed-upon stack of PRs autonomously (implement → validate → self-review → bot review → squash-merge → next).
+- **`spec`** — design a change to this repo and open a tracking epic issue whose `## Steps` feed `/implement`.
 - **`topr`** — rebase a stacked PR onto `origin/main` (squash-merge aware).
 
 > ⚠️ GitHub's `.github`-repo mechanism does **not** auto-distribute `.claude/skills/` to other repos — that magic only covers profiles, issue templates, and workflows. These live here as a canonical, version-controlled copy. To use them in another repo, copy the skill into that repo's `.claude/skills/` or into your user-level `~/.claude/skills/`.

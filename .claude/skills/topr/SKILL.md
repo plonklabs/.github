@@ -1,9 +1,9 @@
 # /topr — Rebase a Stacked PR onto origin/main
 
 ## Description
-Checks out a PR branch, rebases it onto the latest `origin/main` (dropping already-merged commits from earlier PRs in the stack), and force-pushes.
+Checks out a PR branch in **this repo** (`plonklabs/.github`), rebases it onto the latest `origin/main` (dropping already-merged commits from earlier PRs in the stack), and force-pushes. Use it when a stacked PR's parent just merged — typical here when a workflow/profile/skill change depends on an earlier one in the same series.
 
-**This repo uses squash-and-merge.** A naive `git rebase origin/main` will NOT drop already-merged commits because squash-merge creates different SHAs on main. Instead, we must identify the commits unique to this PR and cherry-pick only those onto origin/main.
+**This repo squash-merges, and `main` is protected (PRs only).** A naive `git rebase origin/main` will NOT drop already-merged commits, because squash-merge collapses each parent PR into a single new commit with a different SHA. Instead, identify the commits unique to this PR and cherry-pick only those onto `origin/main`.
 
 ## Arguments
 - `$ARGUMENTS` — the PR number (e.g. `103`)
