@@ -15,9 +15,9 @@ Walk the user through each section of the spec. Ask one section at a time, offer
 2. **Proposal** — High-level solution overview (1-2 paragraphs)
 3. **User Flows** — Concrete scenarios showing how users interact with this feature end-to-end. Each flow should be a numbered sequence of steps from the user's perspective.
 4. **Acceptance Criteria** — Checkbox list of observable, testable outcomes that define "done". These should be verifiable without reading the code.
-5. **Design** — Detailed technical design: types, traits, code flow, code examples where helpful
+5. **Design** — Detailed technical design: types, interfaces, code flow, code examples where helpful
 6. **Changes Required** — List of files/modules affected with specific modifications
-7. **Dependencies** — External crates, services, assumptions, or prerequisites
+7. **Dependencies** — External dependencies, services, assumptions, or prerequisites
 
 For each section, present what you have so far and ask the user to confirm or revise before moving on.
 
@@ -36,7 +36,7 @@ Once the spec is complete:
 
 1. Present the **full epic issue** for final review
 2. Only after the user explicitly approves, create it using `gh issue create`
-3. Apply the `📦 epic` label and any relevant component labels
+3. Apply an `epic` label (create it if the repo doesn't have one) and any relevant component labels
 
 ### Issue Format
 
