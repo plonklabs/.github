@@ -1,0 +1,76 @@
+name: Discord Failure Notification
+
+# Reusable workflow. Call it from a job that should alert on failure:
+#
+#   notify-failure:
+#     needs: [build, test]
+#     if: failure()
+#     uses: plonklabs/.github/.github/workflows/discord-notify-failure.yml@main
+#     with:
+#       workflow_name: My CI
+#     secrets: inherit
+
+on:
+  workflow_call:
+    inputs:
+      workflow_name:
+        description: Human-readable name shown in the failure embed.
+        required: true
+        type: string
+      runs-on:
+        description: Runner to execute on.
+        type: string
+        default: ubuntu-latest
+    secrets:
+      DISCORD_WEBHOOK:
+        required: true
+
+jobs:
+  notify:
+    runs-on: ${{ inputs.runs-on }}
+    permissions: {}
+    steps:
+      - name: Send Discord failure notification
+        env:
+          WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK }}
+          WORKFLOW_NAME: ${{ inputs.workflow_name }}
+          ACTOR: ${{ github.actor }}
+          BRANCH: ${{ github.ref_name }}
+          COMMIT_SHA: ${{ github.sha }}
+          SERVER_URL: ${{ github.server_url }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          SHORT_SHA="${COMMIT_SHA:0:7}"
+          RUN_URL="${SERVER_URL}/${REPO}/actions/runs/${RUN_ID}"
+          COMMIT_URL="${SERVER_URL}/${REPO}/commit/${COMMIT_SHA}"
+
+          PAYLOAD=$(jq -n \
+            --arg workflow "$WORKFLOW_NAME" \
+            --arg run_url "$RUN_URL" \
+            --arg commit "$SHORT_SHA" \
+            --arg commit_url "$COMMIT_URL" \
+            --arg actor "$ACTOR" \
+            --arg actor_url "${SERVER_URL}/${ACTOR}" \
+            --arg branch "$BRANCH" \
+            '{
+              username: "CI Alerts",
+              embeds: [{
+                title: ("❌ " + $workflow + " failed"),
+                url: $run_url,
+                color: 15158332,
+                fields: [
+                  { name: "Commit", value: ("[`" + $commit + "`](" + $commit_url + ")"), inline: true },
+                  { name: "Branch/Tag", value: ("`" + $branch + "`"), inline: true },
+                  { name: "Triggered by", value: ("[" + $actor + "](" + $actor_url + ")"), inline: true }
+                ]
+              }]
+            }')
+
+          response=$(curl -s -w "\n%{http_code}" -H "Content-Type: application/json" \
+            -X POST "$WEBHOOK_URL" -d "$PAYLOAD")
+          http_code=$(echo "$response" | tail -1)
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "::warning::Discord webhook returned HTTP $http_code"
+            echo "$response" | head -n -1
+          fi

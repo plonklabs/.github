@@ -1,0 +1,138 @@
+name: Issue Discord Notifications
+
+# Reusable workflow. Call it from a repo with:
+#
+#   on:
+#     issues:
+#       types: [opened, closed, reopened]
+#     issue_comment:
+#       types: [created]
+#   jobs:
+#     notify:
+#       uses: plonklabs/.github/.github/workflows/discord-issue.yml@main
+#       secrets: inherit
+#
+# The job reads github.event.issue.* / github.event.comment.* from the caller's event.
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: Runner to execute on.
+        type: string
+        default: ubuntu-latest
+    secrets:
+      DISCORD_WEBHOOK:
+        required: true
+
+jobs:
+  notify:
+    runs-on: ${{ inputs.runs-on }}
+    permissions: {}
+    if: >-
+      github.event_name != 'issue_comment'
+      || github.event.comment.user.type != 'Bot'
+    steps:
+      - name: Set event details
+        id: event
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
+          ISSUE_URL: ${{ github.event.issue.html_url }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+        run: |
+          if [ "$EVENT_NAME" = "issue_comment" ]; then
+            echo "title=💬 Issue Comment" >> "$GITHUB_OUTPUT"
+            echo "color=3447003" >> "$GITHUB_OUTPUT"
+          elif [ "$EVENT_ACTION" = "opened" ]; then
+            echo "title=📋 Issue Opened" >> "$GITHUB_OUTPUT"
+            echo "color=2067276" >> "$GITHUB_OUTPUT"
+          elif [ "$EVENT_ACTION" = "reopened" ]; then
+            echo "title=🔁 Issue Reopened" >> "$GITHUB_OUTPUT"
+            echo "color=16776960" >> "$GITHUB_OUTPUT"
+          else
+            echo "title=🔴 Issue Closed" >> "$GITHUB_OUTPUT"
+            echo "color=15158332" >> "$GITHUB_OUTPUT"
+          fi
+          echo "url=${ISSUE_URL}" >> "$GITHUB_OUTPUT"
+          echo "number=${ISSUE_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "issue_title=${ISSUE_TITLE}" >> "$GITHUB_OUTPUT"
+
+      - name: Send Discord notification
+        env:
+          WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          SENDER: ${{ github.event.comment.user.login || github.actor }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          SERVER_URL: ${{ github.server_url }}
+          EMBED_TITLE: ${{ steps.event.outputs.title }}
+          EMBED_URL: ${{ steps.event.outputs.url }}
+          EMBED_COLOR: ${{ steps.event.outputs.color }}
+          EMBED_NUMBER: ${{ steps.event.outputs.number }}
+          EMBED_ISSUE_TITLE: ${{ steps.event.outputs.issue_title }}
+        run: |
+          SENDER_URL="${SERVER_URL}/${SENDER}"
+
+          if [ "$EVENT_NAME" = "issue_comment" ]; then
+            # Truncate comment body to 300 chars to keep the embed concise
+            BODY=$(echo "$COMMENT_BODY" | head -c 300)
+            PAYLOAD=$(jq -n \
+              --arg title "$EMBED_TITLE" \
+              --arg url "$EMBED_URL" \
+              --argjson color "$EMBED_COLOR" \
+              --arg number "$EMBED_NUMBER" \
+              --arg issue_title "$EMBED_ISSUE_TITLE" \
+              --arg body "$BODY" \
+              --arg sender "$SENDER" \
+              --arg sender_url "$SENDER_URL" \
+              --arg repo "$REPO" \
+              --arg repo_url "${SERVER_URL}/${REPO}" \
+              '{
+                username: "GitHub Issues",
+                embeds: [{
+                  title: $title,
+                  url: $url,
+                  color: $color,
+                  fields: [
+                    { name: "Issue", value: ("#" + $number + " " + $issue_title), inline: false },
+                    { name: "Comment", value: $body, inline: false },
+                    { name: "Sender", value: ("[" + $sender + "](" + $sender_url + ")"), inline: true },
+                    { name: "Repo", value: ("[" + $repo + "](" + $repo_url + ")"), inline: true }
+                  ]
+                }]
+              }')
+          else
+            PAYLOAD=$(jq -n \
+              --arg title "$EMBED_TITLE" \
+              --arg url "$EMBED_URL" \
+              --argjson color "$EMBED_COLOR" \
+              --arg number "$EMBED_NUMBER" \
+              --arg issue_title "$EMBED_ISSUE_TITLE" \
+              --arg sender "$SENDER" \
+              --arg sender_url "$SENDER_URL" \
+              --arg repo "$REPO" \
+              --arg repo_url "${SERVER_URL}/${REPO}" \
+              '{
+                username: "GitHub Issues",
+                embeds: [{
+                  title: $title,
+                  url: $url,
+                  color: $color,
+                  fields: [
+                    { name: "Issue", value: ("#" + $number + " " + $issue_title), inline: false },
+                    { name: "Sender", value: ("[" + $sender + "](" + $sender_url + ")"), inline: true },
+                    { name: "Repo", value: ("[" + $repo + "](" + $repo_url + ")"), inline: true }
+                  ]
+                }]
+              }')
+          fi
+
+          response=$(curl -s -w "\n%{http_code}" -H "Content-Type: application/json" \
+            -X POST "$WEBHOOK_URL" -d "$PAYLOAD")
+          http_code=$(echo "$response" | tail -1)
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "::warning::Discord webhook returned HTTP $http_code"
+            echo "$response" | head -n -1
+          fi

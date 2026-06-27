@@ -1,0 +1,63 @@
+name: Release Discord Notifications
+
+# Reusable workflow. Call it from a repo with:
+#
+#   on:
+#     release:
+#       types: [published]
+#   jobs:
+#     notify:
+#       uses: plonklabs/.github/.github/workflows/discord-release.yml@main
+#       secrets: inherit
+#
+# The job reads github.event.release.* from the caller's event.
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: Runner to execute on.
+        type: string
+        default: ubuntu-latest
+    secrets:
+      DISCORD_WEBHOOK:
+        required: true
+
+jobs:
+  notify:
+    runs-on: ${{ inputs.runs-on }}
+    permissions: {}
+    steps:
+      - name: Send Discord notification
+        env:
+          WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK }}
+          RELEASE_BODY: ${{ github.event.release.body }}
+          RELEASE_NAME: ${{ github.event.release.name || github.event.release.tag_name }}
+          RELEASE_URL: ${{ github.event.release.html_url }}
+        run: |
+          # Truncate and escape body for JSON
+          BODY_JSON=$(printf '%s' "$RELEASE_BODY" | head -c 4000 | jq -Rs .)
+
+          PAYLOAD=$(jq -n \
+            --arg name "$RELEASE_NAME" \
+            --arg url "$RELEASE_URL" \
+            --argjson body "$BODY_JSON" \
+            '{
+              content: "@everyone",
+              username: "Release Changelog",
+              embeds: [{
+                title: ("🚀 " + $name),
+                url: $url,
+                color: 2105893,
+                description: $body,
+                footer: { text: "Changelog" }
+              }]
+            }')
+
+          response=$(curl -s -w "\n%{http_code}" -H "Content-Type: application/json" \
+            -X POST "$WEBHOOK_URL" -d "$PAYLOAD")
+          http_code=$(echo "$response" | tail -1)
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "::warning::Discord webhook returned HTTP $http_code"
+            echo "$response" | head -n -1
+          fi

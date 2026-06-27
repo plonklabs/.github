@@ -1,0 +1,102 @@
+name: Claude Code Review
+
+# Reusable workflow. It owns the review scaffolding (checkout, the
+# claude-code-action invocation, the tool allowlist, model, and the
+# collaborators-only gate). The project-specific review instructions live in a
+# REVIEW.md at the calling repo's root — this workflow prepends a dynamic
+# REPO/PR header and feeds the file to Claude as the prompt.
+#
+# Call it from a repo with:
+#
+#   on:
+#     pull_request:
+#       types: [opened, synchronize, ready_for_review]
+#   concurrency:
+#     group: claude-review-${{ github.event.pull_request.number }}
+#     cancel-in-progress: true
+#   jobs:
+#     review:
+#       uses: plonklabs/.github/.github/workflows/claude-review.yml@main
+#       secrets: inherit
+#
+# NOTE: the `## Tools and budget` / `## Output` sections of each repo's REVIEW.md
+# describe the tools Claude has — keep them in sync with the `--allowedTools`
+# list below if you change it.
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: Runner to execute on.
+        type: string
+        default: ubuntu-latest
+      model:
+        description: Model passed to claude-code-action.
+        type: string
+        default: claude-sonnet-4-6
+      max-turns:
+        description: Turn budget for the review session.
+        type: number
+        default: 50
+      collaborators-only:
+        description: >-
+          When true, only run for PRs whose author has repo access
+          (OWNER/MEMBER/COLLABORATOR). Fork PRs don't receive org secrets, so
+          the review couldn't run there anyway.
+        type: boolean
+        default: true
+      review-file:
+        description: Path (relative to repo root) to the review instructions.
+        type: string
+        default: REVIEW.md
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
+
+jobs:
+  review:
+    if: >-
+      ${{ !github.event.pull_request.draft &&
+          (inputs.collaborators-only == false ||
+           contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'),
+                    github.event.pull_request.author_association)) }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compose review prompt
+        id: compose
+        env:
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REVIEW_FILE: ${{ inputs.review-file }}
+        run: |
+          set -euo pipefail
+          if [ ! -f "$REVIEW_FILE" ]; then
+            echo "::error::Review instructions '$REVIEW_FILE' not found at the repository root. Add it, or set the review-file input on the caller."
+            exit 1
+          fi
+          {
+            echo "prompt<<__CLAUDE_REVIEW_PROMPT__"
+            echo "REPO: ${REPO}"
+            echo "PR NUMBER: ${PR_NUMBER}"
+            echo
+            cat "$REVIEW_FILE"
+            echo "__CLAUDE_REVIEW_PROMPT__"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: ${{ steps.compose.outputs.prompt }}
+          claude_args: >-
+            --model ${{ inputs.model }}
+            --max-turns ${{ inputs.max-turns }}
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Read,Grep,Glob,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh api:*),Bash(cat:*),Bash(grep:*),Bash(rg:*),Bash(find:*),Bash(ls:*),Bash(wc:*),Bash(head:*),Bash(tail:*),Bash(awk:*),Bash(sed:*),Bash(jq:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git rev-parse:*),Bash(git status:*),Bash(git branch:*),Bash(git ls-files:*)"
