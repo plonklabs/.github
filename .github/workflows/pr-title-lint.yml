@@ -59,7 +59,7 @@ on:
 
 jobs:
   pr-title:
-    runs-on: ${{ inputs.runs-on }}
+    runs-on: ${{ inputs['runs-on'] }}
     permissions:
       pull-requests: read
     steps:
@@ -70,7 +70,7 @@ jobs:
         with:
           types: ${{ inputs.types }}
           scopes: ${{ inputs.scopes }}
-          requireScope: ${{ inputs.require-scope }}
+          requireScope: ${{ inputs['require-scope'] }}
           # EU convention: the subject is imperative and lowercase. Reject a
           # subject that starts with an uppercase letter.
           subjectPattern: '^(?![A-Z]).+$'
