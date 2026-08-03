@@ -28,21 +28,6 @@ on:
         type: string
         required: false
         default: .github/commit-scopes.txt
-      types:
-        description: >-
-          Newline-separated list of allowed commit types. Defaults to the eight
-          EU / Angular types.
-        type: string
-        required: false
-        default: |
-          feat
-          fix
-          docs
-          style
-          refactor
-          perf
-          test
-          chore
       require-scope:
         description: Whether a scope must always be present in the title.
         type: boolean
@@ -77,7 +62,16 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          types: ${{ inputs.types }}
+          # The eight EU / Angular commit types.
+          types: |
+            feat
+            fix
+            docs
+            style
+            refactor
+            perf
+            test
+            chore
           scopes: ${{ steps.scopes.outputs.list }}
           requireScope: ${{ inputs['require-scope'] }}
           # EU convention: the subject is imperative and lowercase. Reject a
