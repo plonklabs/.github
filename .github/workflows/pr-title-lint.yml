@@ -6,7 +6,10 @@ name: PR Title Lint
 # title becomes the commit subject on the default branch; the title is where
 # the convention is enforced.
 #
-# Call it from a repo with:
+# The allowed scopes are read from a file in the CALLING repo (default
+# `.github/commit-scopes.txt`, one scope per line, `#`-comments and blank
+# lines ignored) so adding a scope is a one-line change there — no edit to
+# this shared workflow. Call it with:
 #
 #   on:
 #     pull_request:
@@ -14,23 +17,17 @@ name: PR Title Lint
 #   jobs:
 #     pr-title:
 #       uses: plonklabs/.github/.github/workflows/pr-title-lint.yml@main
-#       with:
-#         scopes: |
-#           cli
-#           operator
-#           mesh
-#
-# `scopes` is required and repo-specific — keep the list in the calling repo
-# (e.g. read `.github/commit-scopes.txt` in the caller) so adding a scope is a
-# one-line change there, not an edit to this shared workflow.
 
 on:
   workflow_call:
     inputs:
-      scopes:
-        description: Newline-separated list of allowed commit scopes.
+      scopes-file:
+        description: >-
+          Path, in the calling repo, to the newline-delimited allowed-scopes
+          file. Lines starting with `#` and blank lines are ignored.
         type: string
-        required: true
+        required: false
+        default: .github/commit-scopes.txt
       types:
         description: >-
           Newline-separated list of allowed commit types. Defaults to the eight
@@ -61,15 +58,27 @@ jobs:
   pr-title:
     runs-on: ${{ inputs['runs-on'] }}
     permissions:
+      contents: read
       pull-requests: read
     steps:
+      - uses: actions/checkout@v4
+      - id: scopes
+        # Read the calling repo's scope list (comments + blank lines stripped)
+        # into a step output. Same-job step-to-step passing keeps the multiline
+        # value off the reusable-workflow input boundary.
+        run: |
+          {
+            echo 'list<<PR_TITLE_SCOPES_EOF'
+            grep -vE '^[[:space:]]*(#|$)' "${{ inputs['scopes-file'] }}"
+            echo 'PR_TITLE_SCOPES_EOF'
+          } >> "$GITHUB_OUTPUT"
       - name: Validate PR title
         uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v6.1.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           types: ${{ inputs.types }}
-          scopes: ${{ inputs.scopes }}
+          scopes: ${{ steps.scopes.outputs.list }}
           requireScope: ${{ inputs['require-scope'] }}
           # EU convention: the subject is imperative and lowercase. Reject a
           # subject that starts with an uppercase letter.
