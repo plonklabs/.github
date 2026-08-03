@@ -1,0 +1,79 @@
+name: PR Title Lint
+
+# Reusable workflow. Validates a pull request's title against the EU / Angular
+# commit convention — `<type>(<scope>): <subject>` — using
+# amannn/action-semantic-pull-request. Calling repos squash-merge, so the PR
+# title becomes the commit subject on the default branch; the title is where
+# the convention is enforced.
+#
+# Call it from a repo with:
+#
+#   on:
+#     pull_request:
+#       types: [opened, edited, synchronize]
+#   jobs:
+#     pr-title:
+#       uses: plonklabs/.github/.github/workflows/pr-title-lint.yml@main
+#       with:
+#         scopes: |
+#           cli
+#           operator
+#           mesh
+#
+# `scopes` is required and repo-specific — keep the list in the calling repo
+# (e.g. read `.github/commit-scopes.txt` in the caller) so adding a scope is a
+# one-line change there, not an edit to this shared workflow.
+
+on:
+  workflow_call:
+    inputs:
+      scopes:
+        description: Newline-separated list of allowed commit scopes.
+        type: string
+        required: true
+      types:
+        description: >-
+          Newline-separated list of allowed commit types. Defaults to the eight
+          EU / Angular types.
+        type: string
+        required: false
+        default: |
+          feat
+          fix
+          docs
+          style
+          refactor
+          perf
+          test
+          chore
+      require-scope:
+        description: Whether a scope must always be present in the title.
+        type: boolean
+        required: false
+        default: true
+      runs-on:
+        description: Runner to execute on.
+        type: string
+        required: false
+        default: ubuntu-latest
+
+jobs:
+  pr-title:
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      pull-requests: read
+    steps:
+      - name: Validate PR title
+        uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v6.1.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          types: ${{ inputs.types }}
+          scopes: ${{ inputs.scopes }}
+          requireScope: ${{ inputs.require-scope }}
+          # EU convention: the subject is imperative and lowercase. Reject a
+          # subject that starts with an uppercase letter.
+          subjectPattern: '^(?![A-Z]).+$'
+          subjectPatternError: >-
+            The subject "{subject}" must start lowercase and be imperative
+            present tense (e.g. "add", not "Added").
