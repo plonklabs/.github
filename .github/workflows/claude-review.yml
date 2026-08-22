@@ -49,6 +49,24 @@ on:
         description: Path (relative to repo root) to the review instructions.
         type: string
         default: REVIEW.md
+      max-rounds:
+        description: >-
+          Review-round ceiling. Once the bot has posted this many review
+          rounds on a PR, further runs skip the model entirely (spend is
+          capped either way). The check outcome then depends on the bot's
+          open threads: all resolved -> green (merge is a human decision);
+          any unresolved -> red, until each is fixed or declined-with-
+          reasoning and its thread resolved. The ceiling caps spend, never
+          standards.
+        type: number
+        default: 5
+      rereview-max-turns:
+        description: >-
+          Turn budget for re-review rounds (round 2+). Re-reviews focus on
+          the delta since the last reviewed commit, so they need far fewer
+          turns than the first full pass.
+        type: number
+        default: 20
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN:
         required: true
@@ -71,12 +89,95 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Cost guards: count prior bot rounds on this PR, enforce the round
+      # ceiling, and shrink the budget + focus the prompt for re-reviews.
+      # A ceiling skip exits green — the review check being non-blocking at
+      # the ceiling is the policy (merge-or-redesign is a human decision),
+      # and a red here would wrongly block that decision.
+      - name: Cost guards
+        id: guards
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          MAX_ROUNDS: ${{ inputs['max-rounds'] }}
+          FULL_TURNS: ${{ inputs['max-turns'] }}
+          REREVIEW_TURNS: ${{ inputs['rereview-max-turns'] }}
+        run: |
+          set -euo pipefail
+          MARKER='<!-- claude-review-round-ceiling -->'
+
+          # One round == one top-level verdict comment from the bot.
+          comments=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
+            --jq '[.[] | select(.user.login == "claude[bot]")] | length')
+          round=$((comments + 1))
+          echo "round=${round}" >> "$GITHUB_OUTPUT"
+
+          if [ "$round" -gt "$MAX_ROUNDS" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "turns=0" >> "$GITHUB_OUTPUT"
+
+            # The ceiling caps SPEND, not STANDARDS: no more model rounds,
+            # but unresolved bot threads (= unanswered findings) keep the
+            # check red until each is fixed or declined-with-reasoning and
+            # its thread resolved.
+            owner="${REPO%%/*}"; name="${REPO##*/}"
+            unresolved=$(gh api graphql \
+              -f query='query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name){pullRequest(number:$pr){reviewThreads(first:100){nodes{isResolved comments(first:1){nodes{author{login}}}}}}}}' \
+              -F owner="$owner" -F name="$name" -F pr="$PR_NUMBER" \
+              --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false) | select(.comments.nodes[0].author.login | test("claude"))] | length')
+
+            already=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
+              --jq "[.[] | select(.body | contains(\"${MARKER}\"))] | length")
+            if [ "$unresolved" -gt 0 ]; then
+              if [ "$already" -eq 0 ]; then
+                gh pr comment "$PR_NUMBER" --repo "$REPO" --body "${MARKER}
+          **Review round ceiling reached (${MAX_ROUNDS} rounds) with ${unresolved} unresolved review thread(s).** No further automated rounds will run. This check stays failing until every open bot thread is either fixed or declined with reasoning and its thread resolved — then re-run this check. If the findings indicate a design problem, redesign instead of iterating."
+              fi
+              echo "::error::Round ceiling reached with ${unresolved} unresolved bot review thread(s) — resolve (fix or reasoned-decline) each thread, then re-run this check."
+              exit 1
+            fi
+            if [ "$already" -eq 0 ]; then
+              gh pr comment "$PR_NUMBER" --repo "$REPO" --body "${MARKER}
+          **Review round ceiling reached (${MAX_ROUNDS} rounds); all bot threads resolved.** Automated review stops here — the merge decision is now human."
+            fi
+            exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+          if [ "$round" -eq 1 ]; then
+            echo "turns=${FULL_TURNS}" >> "$GITHUB_OUTPUT"
+            echo "focus=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Re-review: focus on the delta since the last commit the bot
+          # left inline comments on (best-effort — inline review comments
+          # carry commit_id; top-level verdicts do not).
+          last_sha=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/comments" --paginate \
+            --jq '[.[] | select(.user.login == "claude[bot]")] | last | .commit_id // empty' || true)
+          echo "turns=${REREVIEW_TURNS}" >> "$GITHUB_OUTPUT"
+          {
+            echo "focus<<__CLAUDE_REVIEW_FOCUS__"
+            echo
+            echo "RE-REVIEW, ROUND ${round}. You have already reviewed this PR."
+            if [ -n "$last_sha" ]; then
+              echo "Review ONLY the delta since your last reviewed commit: \`git diff ${last_sha}..HEAD\`."
+            else
+              echo "Review ONLY the changes pushed since your previous review (see the newest commits)."
+            fi
+            echo "Verify your prior findings were addressed, flag anything NEW the delta introduces, and do not re-describe or re-litigate the rest of the PR or resolved threads. Your budget this round is ${REREVIEW_TURNS} turns — be brief."
+            echo "__CLAUDE_REVIEW_FOCUS__"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Compose review prompt
         id: compose
+        if: steps.guards.outputs.skip != 'true'
         env:
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REVIEW_FILE: ${{ inputs['review-file'] }}
+          FOCUS: ${{ steps.guards.outputs.focus }}
         run: |
           set -euo pipefail
           if [ ! -f "$REVIEW_FILE" ]; then
@@ -89,14 +190,18 @@ jobs:
             echo "PR NUMBER: ${PR_NUMBER}"
             echo
             cat "$REVIEW_FILE"
+            if [ -n "$FOCUS" ]; then
+              echo "$FOCUS"
+            fi
             echo "__CLAUDE_REVIEW_PROMPT__"
           } >> "$GITHUB_OUTPUT"
 
       - uses: anthropics/claude-code-action@v1
+        if: steps.guards.outputs.skip != 'true'
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           prompt: ${{ steps.compose.outputs.prompt }}
           claude_args: >-
             --model ${{ inputs.model }}
-            --max-turns ${{ inputs['max-turns'] }}
+            --max-turns ${{ steps.guards.outputs.turns }}
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Read,Grep,Glob,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh api:*),Bash(cat:*),Bash(grep:*),Bash(rg:*),Bash(find:*),Bash(ls:*),Bash(wc:*),Bash(head:*),Bash(tail:*),Bash(awk:*),Bash(sed:*),Bash(jq:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git rev-parse:*),Bash(git status:*),Bash(git branch:*),Bash(git ls-files:*)"
