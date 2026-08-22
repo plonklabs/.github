@@ -52,10 +52,14 @@ on:
       max-rounds:
         description: >-
           Review-round ceiling. Once the bot has posted this many review
-          rounds on a PR, further runs skip the model entirely and post a
-          single ceiling notice — the merge-or-redesign decision is human.
+          rounds on a PR, further runs skip the model entirely (spend is
+          capped either way). The check outcome then depends on the bot's
+          open threads: all resolved -> green (merge is a human decision);
+          any unresolved -> red, until each is fixed or declined-with-
+          reasoning and its thread resolved. The ceiling caps spend, never
+          standards.
         type: number
-        default: 4
+        default: 5
       rereview-max-turns:
         description: >-
           Turn budget for re-review rounds (round 2+). Re-reviews focus on
@@ -111,13 +115,32 @@ jobs:
 
           if [ "$round" -gt "$MAX_ROUNDS" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "turns=0" >> "$GITHUB_OUTPUT"
+
+            # The ceiling caps SPEND, not STANDARDS: no more model rounds,
+            # but unresolved bot threads (= unanswered findings) keep the
+            # check red until each is fixed or declined-with-reasoning and
+            # its thread resolved.
+            owner="${REPO%%/*}"; name="${REPO##*/}"
+            unresolved=$(gh api graphql \
+              -f query='query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name){pullRequest(number:$pr){reviewThreads(first:100){nodes{isResolved comments(first:1){nodes{author{login}}}}}}}}' \
+              -F owner="$owner" -F name="$name" -F pr="$PR_NUMBER" \
+              --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false) | select(.comments.nodes[0].author.login | test("claude"))] | length')
+
             already=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
               --jq "[.[] | select(.body | contains(\"${MARKER}\"))] | length")
+            if [ "$unresolved" -gt 0 ]; then
+              if [ "$already" -eq 0 ]; then
+                gh pr comment "$PR_NUMBER" --repo "$REPO" --body "${MARKER}
+          **Review round ceiling reached (${MAX_ROUNDS} rounds) with ${unresolved} unresolved review thread(s).** No further automated rounds will run. This check stays failing until every open bot thread is either fixed or declined with reasoning and its thread resolved — then re-run this check. If the findings indicate a design problem, redesign instead of iterating."
+              fi
+              echo "::error::Round ceiling reached with ${unresolved} unresolved bot review thread(s) — resolve (fix or reasoned-decline) each thread, then re-run this check."
+              exit 1
+            fi
             if [ "$already" -eq 0 ]; then
               gh pr comment "$PR_NUMBER" --repo "$REPO" --body "${MARKER}
-          **Review round ceiling reached (${MAX_ROUNDS} rounds).** Automated review stops here — per policy the remaining decision is binary: merge on the existing findings, or redesign. Re-request a review round only after a substantive rework."
+          **Review round ceiling reached (${MAX_ROUNDS} rounds); all bot threads resolved.** Automated review stops here — the merge decision is now human."
             fi
-            echo "turns=0" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           echo "skip=false" >> "$GITHUB_OUTPUT"
