@@ -157,14 +157,35 @@ jobs:
           last_sha=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/comments" --paginate \
             --jq '[.[] | select(.user.login == "claude[bot]")] | last | .commit_id // empty' || true)
           echo "turns=${REREVIEW_TURNS}" >> "$GITHUB_OUTPUT"
+
+          # The PR's own non-merge commits, oldest first. Sourced from
+          # the API rather than from git ancestry: on a `pull_request`
+          # event the checkout is `refs/pull/N/merge`, so HEAD carries
+          # the base branch's tip as a parent. A `<reviewed-sha>..HEAD`
+          # range therefore contains every base-branch commit landed
+          # since the branch point, and the "delta" grows with the base
+          # branch's traffic rather than with what the author wrote.
+          # The API's commit list excludes anything reachable from the
+          # base, so it is bounded by the PR's own size no matter what
+          # lands upstream.
+          pr_shas=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/commits" --paginate \
+            --jq '.[] | select(.parents | length == 1) | .sha' || true)
+          new_commits=""
+          if [ -n "$last_sha" ]; then
+            new_commits=$(printf '%s\n' "$pr_shas" \
+              | awk -v s="$last_sha" 'seen { print } $0 == s { seen = 1 }')
+          fi
           {
             echo "focus<<__CLAUDE_REVIEW_FOCUS__"
             echo
             echo "RE-REVIEW, ROUND ${round}. You have already reviewed this PR."
-            if [ -n "$last_sha" ]; then
-              echo "Review ONLY the delta since your last reviewed commit: \`git diff ${last_sha}..HEAD\`."
+            if [ -n "$new_commits" ]; then
+              echo "The PR's own new commits since your last review are, oldest first:"
+              echo "$new_commits" | sed 's/^/  /'
+              echo "Review ONLY what those commits changed — inspect them with \`git show <sha>\`."
+              echo "Do NOT review a \`${last_sha}..HEAD\` range. If this branch was updated from its base branch, that range also contains the base branch's commits, which are not this PR's work."
             else
-              echo "Review ONLY the changes pushed since your previous review (see the newest commits)."
+              echo "Review ONLY the changes pushed since your previous review. \`gh pr diff\` gives this PR's diff against its base; focus on its newest commits."
             fi
             echo "Verify your prior findings were addressed, flag anything NEW the delta introduces, and do not re-describe or re-litigate the rest of the PR or resolved threads. Your budget this round is ${REREVIEW_TURNS} turns — be brief."
             echo "__CLAUDE_REVIEW_FOCUS__"
