@@ -289,6 +289,7 @@ jobs:
             {
               echo "skip=true"
               echo "turns=0"
+              echo "carried_verdict=${prev_state}"
             } >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -398,4 +399,64 @@ jobs:
           if ! gh pr comment "$PR_NUMBER" --repo "$REPO" --body "${IDS_MARKER}
           <sub>Review round ${ROUND} read the content above. A later rebase of these same commits reuses that verdict instead of re-reviewing.</sub>"; then
             echo "::warning::Could not record this round's patch-ids; the next round re-reviews in full."
+          fi
+
+      # A clean verdict with no open bot thread is the review side saying yes,
+      # so say it in the one place the merge actually waits: auto-merge. It
+      # still holds for every required check and for branch protection —
+      # enabling it removes only the human round-trip of pressing the button
+      # once review is satisfied.
+      #
+      # `Verdict: findings` never touches auto-merge, so a later clean round is
+      # what enables it. Neither does a ceiling round: it produced no verdict.
+      # The whole decision is in the shell rather than split with a step-level
+      # `if:`, so every branch of it is reachable from a test.
+      - name: Enable auto-merge on a clean verdict
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PRIOR_COMMENT_ID: ${{ steps.guards.outputs.prior_comment_id }}
+          SKIP: ${{ steps.guards.outputs.skip }}
+          CARRIED_VERDICT: ${{ steps.guards.outputs.carried_verdict }}
+        run: |
+          set -uo pipefail
+          state="${CARRIED_VERDICT:-}"
+          if [ "$SKIP" = "true" ] && [ -z "$state" ]; then
+            echo "Round ceiling: no verdict was produced or carried; auto-merge untouched."
+            exit 0
+          fi
+
+          # A round that ran this job states its verdict in the comment it just
+          # posted — the only comment from the reviewer newer than the id the
+          # guards recorded before the round started.
+          if [ -z "$state" ]; then
+            state=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate --jq '.[]' \
+              | jq -rs --argjson prior "${PRIOR_COMMENT_ID:-0}" \
+                  '[.[] | select(.user.login == "claude[bot]") | select(.id > $prior) | .body // ""] | last // ""' \
+              | sed -nE 's/^[[:blank:]>*_]*[Vv]erdict:[[:blank:]*_]*([Cc]lean|[Ff]indings).*/\1/p' \
+              | tail -1 | tr '[:upper:]' '[:lower:]')
+          fi
+
+          if [ "$state" != "clean" ]; then
+            echo "Verdict is '${state:-none}'; auto-merge untouched."
+            exit 0
+          fi
+
+          # Same reading as the ceiling's: a thread the reviewer opened and
+          # nobody resolved is an unanswered finding, whatever the verdict line
+          # says. It has to stay a separate query — the verdict comment carries
+          # no thread state.
+          owner="${REPO%%/*}"; name="${REPO##*/}"
+          unresolved=$(gh api graphql \
+            -f query='query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name){pullRequest(number:$pr){reviewThreads(first:100){nodes{isResolved comments(first:1){nodes{author{login}}}}}}}}' \
+            -F owner="$owner" -F name="$name" -F pr="$PR_NUMBER" \
+            --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false) | select(.comments.nodes[0].author.login | test("claude"))] | length')
+          if [ "${unresolved:-1}" -gt 0 ]; then
+            echo "Verdict clean but ${unresolved} unresolved bot thread(s); auto-merge untouched."
+            exit 0
+          fi
+
+          if ! gh pr merge "$PR_NUMBER" --repo "$REPO" --auto --squash; then
+            echo "::warning::Could not enable auto-merge (the repository may not allow it); merge by hand."
           fi

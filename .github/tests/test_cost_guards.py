@@ -74,6 +74,12 @@ if argv[0] == "pr" and argv[1] == "comment":
     save(state)
     sys.exit(0)
 
+if argv[0] == "pr" and argv[1] == "merge":
+    if state.get("automerge_forbidden"):
+        sys.stderr.write("gh stub: auto-merge not allowed on this repository\n")
+        sys.exit(1)
+    sys.exit(0)
+
 if argv[0] != "api":
     sys.stderr.write("gh stub: unsupported command %r\n" % argv)
     sys.exit(2)
@@ -202,6 +208,10 @@ class Fixture:
     @property
     def posted(self):
         return [c for c in self.state["comments"] if c["user"]["login"] == "github-actions[bot]"]
+
+    @property
+    def automerge_calls(self):
+        return [c for c in self.state.get("calls", []) if c[:2] == ["pr", "merge"]]
 
 
 def parse_outputs(text):
@@ -547,6 +557,88 @@ def test_ceiling_counts_model_rounds_only():
         check("unresolved bot thread keeps the check red", proc2.returncode == 1, proc2.stdout)
 
 
+# --------------------------------------------------------------------------
+# A clean verdict with no open bot thread enables auto-merge; anything else
+# leaves the merge button alone.
+# --------------------------------------------------------------------------
+AUTOMERGE = "Enable auto-merge on a clean verdict"
+
+
+def test_auto_merge_follows_the_verdict():
+    case("auto-merge: enabled on a clean verdict only")
+    with tempfile.TemporaryDirectory() as tmp:
+        f = Fixture(tmp)
+        f._git("switch", "-q", "-c", "feature")
+        a = f.commit("a.txt", "alpha\n", "add alpha")
+        f.state["pr_commits"] = [a]
+        ids = f.patch_ids([a])
+        prior = "1200"
+
+        def attempt(env, **kw):
+            f.state["calls"] = []
+            proc, _ = f.run(AUTOMERGE, extra_env=env, **kw)
+            return proc, f.automerge_calls
+
+        # This round's own verdict is the newest reviewer comment above the id
+        # the guards recorded before the round ran.
+        f.state["next_id"] = 1300
+        f.bot_verdict("Looks good.\n\nVerdict: clean", ids=ids)
+        proc, calls = attempt({"SKIP": "false", "CARRIED_VERDICT": "",
+                               "PRIOR_COMMENT_ID": prior})
+        check("clean verdict exits 0", proc.returncode == 0, proc.stderr)
+        check("clean verdict enables auto-merge", len(calls) == 1, calls)
+        check("auto-merge is a squash", calls and "--auto" in calls[0] and "--squash" in calls[0],
+              calls)
+
+        # A verdict older than this round's cursor is not this round's verdict.
+        proc, calls = attempt({"SKIP": "false", "CARRIED_VERDICT": "",
+                               "PRIOR_COMMENT_ID": "9999"})
+        check("a verdict below the round cursor is ignored", not calls, calls)
+
+        f.state["comments"] = []
+        f.state["next_id"] = 1300
+        f.bot_verdict("Two problems.\n\nVerdict: findings", ids=ids)
+        proc, calls = attempt({"SKIP": "false", "CARRIED_VERDICT": "",
+                               "PRIOR_COMMENT_ID": prior})
+        check("findings exits 0", proc.returncode == 0, proc.stderr)
+        check("findings leaves auto-merge alone", not calls, calls)
+
+        # Carried over across a content-free push: the verdict still counts.
+        f.state["comments"] = []
+        proc, calls = attempt({"SKIP": "true", "CARRIED_VERDICT": "clean",
+                               "PRIOR_COMMENT_ID": prior})
+        check("carried-over clean enables auto-merge", len(calls) == 1, calls)
+
+        proc, calls = attempt({"SKIP": "true", "CARRIED_VERDICT": "findings",
+                               "PRIOR_COMMENT_ID": prior})
+        check("carried-over findings leaves auto-merge alone", not calls, calls)
+
+        # The ceiling produced no verdict at all.
+        proc, calls = attempt({"SKIP": "true", "CARRIED_VERDICT": "", "PRIOR_COMMENT_ID": ""})
+        check("ceiling round exits 0", proc.returncode == 0, proc.stderr)
+        check("ceiling round leaves auto-merge alone", not calls, calls)
+
+        # A clean line does not override a thread nobody answered.
+        f.state["comments"] = []
+        f.state["next_id"] = 1300
+        f.bot_verdict("Looks good.\n\nVerdict: clean", ids=ids)
+        f.state["review_threads"] = [
+            {"isResolved": False, "comments": {"nodes": [{"author": {"login": "claude[bot]"}}]}}
+        ]
+        proc, calls = attempt({"SKIP": "false", "CARRIED_VERDICT": "",
+                               "PRIOR_COMMENT_ID": prior})
+        check("unresolved bot thread blocks auto-merge", not calls, calls)
+        f.state["review_threads"] = []
+
+        # A repository that refuses auto-merge is a warning, not a red check.
+        f.state["automerge_forbidden"] = True
+        proc, calls = attempt({"SKIP": "false", "CARRIED_VERDICT": "",
+                               "PRIOR_COMMENT_ID": prior})
+        check("a refused auto-merge does not fail the run", proc.returncode == 0, proc.stderr)
+        check("the refusal is surfaced as a warning",
+              "::warning::" in proc.stdout, proc.stdout)
+
+
 def main():
     for tool in ("yq", "jq", "git"):
         if shutil.which(tool) is None:
@@ -560,6 +652,7 @@ def main():
     test_missing_verdict_line_blocks_carry_over()
     test_human_comment_cannot_forge_a_carry_over()
     test_ceiling_counts_model_rounds_only()
+    test_auto_merge_follows_the_verdict()
     print()
     if FAILURES:
         print(f"{len(FAILURES)} check(s) failed:")
