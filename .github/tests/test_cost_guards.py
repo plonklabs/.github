@@ -61,6 +61,9 @@ def opt(name):
     return argv[argv.index(name) + 1] if name in argv else None
 
 if argv[0] == "pr" and argv[1] == "comment":
+    if state.get("comment_forbidden"):
+        sys.stderr.write("gh stub: comment creation forbidden\n")
+        sys.exit(1)
     body = opt("--body")
     state["comments"].append({
         "id": state["next_id"],
@@ -83,18 +86,6 @@ if path == "graphql":
     payload = {"data": {"repository": {"pullRequest": {"reviewThreads": {
         "nodes": state.get("review_threads", [])}}}}}
     sys.stdout.write(jq(payload, filt))
-    sys.exit(0)
-
-if "--method" in argv and opt("--method") == "PATCH":
-    body = json.load(sys.stdin)["body"]
-    cid = int(path.rsplit("/", 1)[1])
-    if state.get("patch_forbidden"):
-        sys.stderr.write("gh stub: PATCH forbidden\n")
-        sys.exit(1)
-    for c in state["comments"]:
-        if c["id"] == cid:
-            c["body"] = body
-    save(state)
     sys.exit(0)
 
 if path.endswith("/comments") and "/issues/" in path and not path.rsplit("/", 2)[-2] == "issues":
@@ -249,15 +240,18 @@ def case(name):
 
 
 # --------------------------------------------------------------------------
-# Acceptance: round 1 reviews in full and records the patch-ids it reviewed.
+# Acceptance: round 1 reviews in full, and the round it runs is recorded — on
+# the reviewer's own verdict comment when the reviewer copies the marker line,
+# and by the workflow itself when it does not.
 # --------------------------------------------------------------------------
-def test_round_one_records_patch_ids():
-    case("round 1: full review, patch-ids recorded on the verdict comment")
+def test_round_one_full_review_and_marker_instruction():
+    case("round 1: full review, marker instruction in the prompt")
     with tempfile.TemporaryDirectory() as tmp:
         f = Fixture(tmp)
         f._git("switch", "-q", "-c", "feature")
         a = f.commit("a.txt", "alpha\n", "add alpha")
         f.state["pr_commits"] = [a]
+        marker = IDS_PREFIX + ",".join(f.patch_ids([a])) + " -->"
 
         proc, out = f.run("Cost guards")
         check("guards exit 0", proc.returncode == 0, proc.stderr)
@@ -266,16 +260,77 @@ def test_round_one_records_patch_ids():
         check("full turn budget", out.get("turns") == "50", out)
         check("no focus text", out.get("focus") == "", out)
         check("prior_comment_id == 0", out.get("prior_comment_id") == "0", out)
+        check("marker exposed for the prompt", out.get("ids_marker") == marker, out)
 
-        # The model round posts its verdict; the recording step anchors it.
+        (f.repo / "REVIEW.md").write_text("Review this PR.\n")
+        comp, cout = f.run("Compose review prompt",
+                           extra_env={"REVIEW_FILE": "REVIEW.md", "FOCUS": out["focus"],
+                                      "IDS_MARKER": out["ids_marker"]})
+        check("compose exit 0", comp.returncode == 0, comp.stderr)
+        check("prompt carries the review file", "Review this PR." in cout.get("prompt", ""), cout)
+        check("prompt asks for the marker as the last line",
+              marker in cout.get("prompt", ""), cout.get("prompt"))
+
+
+def test_recording_defers_to_the_reviewer_then_falls_back():
+    case("recording: the reviewer's own marker line is accepted as the record")
+    with tempfile.TemporaryDirectory() as tmp:
+        f = Fixture(tmp)
+        f._git("switch", "-q", "-c", "feature")
+        a = f.commit("a.txt", "alpha\n", "add alpha")
+        f.state["pr_commits"] = [a]
+        _, out = f.run("Cost guards")
+
+        f.bot_verdict("All good.\n\nVerdict: clean\n\n" + out["ids_marker"])
+        rec, _ = f.run("Record reviewed patch-ids",
+                       extra_env={"PRIOR_COMMENT_ID": out["prior_comment_id"],
+                                  "IDS_MARKER": out["ids_marker"], "ROUND": out["round"]})
+        check("record exit 0", rec.returncode == 0, rec.stderr)
+        check("no fallback comment posted", not f.posted, f.posted)
+
+    case("recording: the workflow posts the marker when the reviewer omits it")
+    with tempfile.TemporaryDirectory() as tmp:
+        f = Fixture(tmp)
+        f._git("switch", "-q", "-c", "feature")
+        a = f.commit("a.txt", "alpha\n", "add alpha")
+        f.state["pr_commits"] = [a]
+        _, out = f.run("Cost guards")
+
         f.bot_verdict("All good.\n\nVerdict: clean")
         rec, _ = f.run("Record reviewed patch-ids",
-                       extra_env={"PRIOR_COMMENT_ID": out["prior_comment_id"]})
+                       extra_env={"PRIOR_COMMENT_ID": out["prior_comment_id"],
+                                  "IDS_MARKER": out["ids_marker"], "ROUND": out["round"]})
         check("record exit 0", rec.returncode == 0, rec.stderr)
-        body = f.state["comments"][-1]["body"]
-        check("marker appended to the bot's verdict",
-              body.endswith(IDS_PREFIX + ",".join(f.patch_ids([a])) + " -->\n"), body)
-        check("verdict text preserved", body.startswith("All good.\n\nVerdict: clean"), body)
+        check("one fallback marker comment", len(f.posted) == 1, f.posted)
+        check("fallback carries the marker",
+              f.posted[-1]["body"].startswith(out["ids_marker"]), f.posted)
+
+        # The fallback comment is the anchor for the next round: a rebase of
+        # the same content must now carry the verdict over.
+        f._git("switch", "-q", "main")
+        f.commit("u.txt", "up\n", "up")
+        f._git("switch", "-q", "feature")
+        f._git("rebase", "-q", "main")
+        f.state["pr_commits"] = f.branch_commits()
+        _, out2 = f.run("Cost guards")
+        check("rebase after a fallback record carries over",
+              out2.get("skip") == "true", out2)
+
+    case("recording: a refused comment warns instead of reddening the check")
+    with tempfile.TemporaryDirectory() as tmp:
+        f = Fixture(tmp)
+        f._git("switch", "-q", "-c", "feature")
+        a = f.commit("a.txt", "alpha\n", "add alpha")
+        f.state["pr_commits"] = [a]
+        _, out = f.run("Cost guards")
+
+        f.bot_verdict("All good.\n\nVerdict: clean")
+        f.state["comment_forbidden"] = True
+        rec, _ = f.run("Record reviewed patch-ids",
+                       extra_env={"PRIOR_COMMENT_ID": out["prior_comment_id"],
+                                  "IDS_MARKER": out["ids_marker"], "ROUND": out["round"]})
+        check("record exit 0", rec.returncode == 0, rec.stderr)
+        check("warns", "::warning::" in rec.stdout, rec.stdout)
 
 
 # --------------------------------------------------------------------------
@@ -423,6 +478,20 @@ def test_missing_verdict_line_blocks_carry_over():
         check("skip=false", out.get("skip") == "false", out)
         check("no carried-over comment", not f.posted, f.posted)
 
+    case("another workflow's Verdict line under the same bot login: ignored")
+    with tempfile.TemporaryDirectory() as tmp:
+        f = Fixture(tmp)
+        f._git("switch", "-q", "-c", "feature")
+        a = f.commit("a.txt", "alpha\n", "add alpha")
+        f.bot_verdict("Looks fine to me.", ids=f.patch_ids([a]))
+        f.add_comment("github-actions[bot]", "some other workflow\n\nVerdict: clean")
+        f.state["pr_commits"] = [a]
+
+        proc, out = f.run("Cost guards")
+        check("skip=false", out.get("skip") == "false", out)
+        check("no carried-over comment",
+              not [c for c in f.posted if CARRIED_MARKER in c["body"]], f.posted)
+
 
 # --------------------------------------------------------------------------
 # A human quoting a verdict line or a marker must not steer the guards.
@@ -478,44 +547,12 @@ def test_ceiling_counts_model_rounds_only():
         check("unresolved bot thread keeps the check red", proc2.returncode == 1, proc2.stdout)
 
 
-# --------------------------------------------------------------------------
-# Recording is best-effort: a refused PATCH warns and leaves the next round to
-# re-review in full rather than failing the check.
-# --------------------------------------------------------------------------
-def test_record_is_best_effort():
-    case("recording: a refused comment edit warns instead of failing the check")
-    with tempfile.TemporaryDirectory() as tmp:
-        f = Fixture(tmp)
-        f._git("switch", "-q", "-c", "feature")
-        a = f.commit("a.txt", "alpha\n", "add alpha")
-        f.state["pr_commits"] = [a]
-        _, out = f.run("Cost guards")
-
-        f.bot_verdict("All good.\n\nVerdict: clean")
-        f.state["patch_forbidden"] = True
-        rec, _ = f.run("Record reviewed patch-ids",
-                       extra_env={"PRIOR_COMMENT_ID": out["prior_comment_id"]})
-        check("record exit 0", rec.returncode == 0, rec.stderr)
-        check("warns", "::warning::" in rec.stdout, rec.stdout)
-
-    case("recording: no verdict comment this round is a warning, not a failure")
-    with tempfile.TemporaryDirectory() as tmp:
-        f = Fixture(tmp)
-        f._git("switch", "-q", "-c", "feature")
-        a = f.commit("a.txt", "alpha\n", "add alpha")
-        f.state["pr_commits"] = [a]
-        _, out = f.run("Cost guards")
-        rec, _ = f.run("Record reviewed patch-ids",
-                       extra_env={"PRIOR_COMMENT_ID": out["prior_comment_id"]})
-        check("record exit 0", rec.returncode == 0, rec.stderr)
-        check("warns", "::warning::" in rec.stdout, rec.stdout)
-
-
 def main():
     for tool in ("yq", "jq", "git"):
         if shutil.which(tool) is None:
             sys.exit(f"required tool not on PATH: {tool}")
-    test_round_one_records_patch_ids()
+    test_round_one_full_review_and_marker_instruction()
+    test_recording_defers_to_the_reviewer_then_falls_back()
     test_rebase_identical_content_carries_over()
     test_rebase_plus_fix_reviews_only_the_fix()
     test_dropped_commit_still_reviews()
@@ -523,7 +560,6 @@ def main():
     test_missing_verdict_line_blocks_carry_over()
     test_human_comment_cannot_forge_a_carry_over()
     test_ceiling_counts_model_rounds_only()
-    test_record_is_best_effort()
     print()
     if FAILURES:
         print(f"{len(FAILURES)} check(s) failed:")

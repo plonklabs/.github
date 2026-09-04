@@ -65,9 +65,13 @@ jobs:
 
 Inputs: `runs-on` (default `ubuntu-latest`), `model` (default `claude-sonnet-4-6`), `max-turns` (default `50`), `collaborators-only` (default `true`), `review-file` (default `REVIEW.md`), `max-rounds` (default `5`), `rereview-max-turns` (default `20`). Secret: `CLAUDE_CODE_OAUTH_TOKEN`.
 
-**Rounds are counted in content, not pushes.** Each round records `git patch-id` for every commit of the PR in a hidden marker on that round's verdict comment. A rebase rewrites every SHA but preserves patch-ids, so a force-push that changes nothing runs no model round, does not advance the round counter toward `max-rounds`, and posts a short carried-over comment repeating the previous round's `Verdict:` line. A rebase that also adds a commit is re-reviewed as exactly that commit.
+**Rounds are counted in content, not pushes.** Each round leaves behind a hidden marker holding `git patch-id` for every commit of the PR — the reviewer is asked to end its verdict comment with the line, and the workflow posts it itself if the reviewer omits it. A rebase rewrites every SHA but preserves patch-ids, so a force-push that changes nothing runs no model round, does not advance the round counter toward `max-rounds`, and posts a short carried-over comment repeating the previous round's `Verdict:` line. A rebase that also adds a commit is re-reviewed as exactly that commit.
 
-> Consumer merge gates that tie a verdict to the head SHA must accept the carried-over comment: it is posted by the workflow's own token (`github-actions[bot]`), not by `claude[bot]`, and carries the `<!-- claude-review-carried-over -->` marker.
+Only `[bot]` logins may supply a marker, and only the reviewer (or a carried-over comment repeating one verbatim) may supply a verdict, so a PR author cannot talk the guards into skipping a round.
+
+> **Consumer merge gates** that tie a verdict to the head SHA must accept the carried-over comment: it is posted by the workflow's own token (`github-actions[bot]`), not by `claude[bot]`, and carries the `<!-- claude-review-carried-over -->` marker.
+
+The workflow needs no permissions beyond the `contents: read`, `pull-requests: write`, `id-token: write` it already had — a reusable workflow that requests more than its caller grants fails the run at startup, so the marker is written by *creating* a comment, never by editing one.
 
 The guards are covered by `.github/tests/test_cost_guards.py`, run by the `tests` workflow.
 

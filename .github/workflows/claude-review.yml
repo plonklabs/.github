@@ -94,9 +94,11 @@ jobs:
       # ceiling, and decide whether this push needs a model round at all.
       #
       # The re-review delta is anchored on CONTENT, not on commit SHAs. Each
-      # round records `git patch-id --stable` for every non-merge commit of the
-      # PR in a hidden marker on that round's verdict comment. A rebase
-      # rewrites every SHA but preserves patch-ids, so:
+      # round leaves behind a hidden marker holding `git patch-id --stable` for
+      # every non-merge commit of the PR — on the reviewer's own verdict comment
+      # when it copies the marker line it is given, and posted by the workflow
+      # when it does not. A rebase rewrites every SHA but preserves patch-ids,
+      # so:
       #   - identical patch-id multiset -> no model round, verdict carries over
       #   - multiset gained entries     -> review exactly the gained commits
       #   - changed any other way (a commit dropped, or no marker recorded yet)
@@ -215,19 +217,39 @@ jobs:
             printf '%s\t%s\n' "$sha" "${id:-empty}" >> "$pairs"
           done < "$shas"
 
-          # The bot's own comments plus any carried-over verdict this workflow
-          # posted: the only bodies allowed to supply a recorded patch-id set or
-          # a verdict line. A human quoting either must not steer the gate.
-          bodies="${work}/claude-review-verdict-bodies.txt"
-          jq -r --arg carried "$CARRIED_MARKER" \
-            '.[] | select(.user.login == "claude[bot]" or ((.body // "") | contains($carried)))
-                 | .body // ""' "$comments" > "$bodies"
+          # Patch-id markers are written by the reviewer or by this workflow;
+          # both are `[bot]` logins no PR author can post as, so a human
+          # quoting a marker cannot steer the guards.
+          bodies="${work}/claude-review-marker-bodies.txt"
+          jq -r '.[] | select(.user.login == "claude[bot]" or .user.login == "github-actions[bot]")
+                     | .body // ""' "$comments" > "$bodies"
 
-          # Highest bot comment id seen before this round. Comment ids increase
-          # monotonically, so the recording step can identify this round's
-          # verdict without depending on runner-vs-server clock agreement.
-          prior_comment_id=$(jq '[.[] | select(.user.login == "claude[bot]") | .id] | max // 0' "$comments")
-          echo "prior_comment_id=${prior_comment_id}" >> "$GITHUB_OUTPUT"
+          # A verdict, though, may only come from the reviewer, or from a
+          # carried-over comment repeating one verbatim — never from any other
+          # workflow that happens to run under the same bot identity.
+          verdicts="${work}/claude-review-verdict-bodies.txt"
+          jq -r --arg carried "$CARRIED_MARKER" \
+            '.[] | select(.user.login == "claude[bot]"
+                          or (.user.login == "github-actions[bot]"
+                              and ((.body // "") | contains($carried))))
+                 | .body // ""' "$comments" > "$verdicts"
+
+          # Highest comment id seen before this round. Comment ids increase
+          # monotonically, so the recording step can identify what this round
+          # posted without depending on runner-vs-server clock agreement.
+          prior_comment_id=$(jq '[.[] | .id] | max // 0' "$comments")
+
+          # The marker this round must leave behind. The reviewer is asked to
+          # end its verdict comment with it; the recording step posts it itself
+          # if the reviewer did not.
+          ids_marker=""
+          if [ -s "$pairs" ]; then
+            ids_marker="${IDS_PREFIX}$(cut -f2 "$pairs" | paste -sd, -) -->"
+          fi
+          {
+            echo "prior_comment_id=${prior_comment_id}"
+            echo "ids_marker=${ids_marker}"
+          } >> "$GITHUB_OUTPUT"
 
           if [ "$round" -eq 1 ]; then
             {
@@ -244,7 +266,7 @@ jobs:
             | tr ',' '\n' | sed '/^$/d' | sort > "$recorded" || true
 
           prev_state=$(sed -nE 's/^[[:blank:]>*_]*[Vv]erdict:[[:blank:]*_]*([Cc]lean|[Ff]indings).*/\1/p' \
-            "$bodies" | tail -1 | tr '[:upper:]' '[:lower:]')
+            "$verdicts" | tail -1 | tr '[:upper:]' '[:lower:]')
 
           # A rebase that carries the same content yields the same multiset of
           # patch-ids. Comparing multisets, rather than only asking whether
@@ -258,7 +280,6 @@ jobs:
             # Re-record the set so a chain of rebases keeps its anchor, and
             # repeat the previous round's `Verdict:` line so consumer merge
             # gates that read a verdict at head still find one.
-            ids_marker="${IDS_PREFIX}$(cut -f2 "$pairs" | paste -sd, -) -->"
             gh pr comment "$PR_NUMBER" --repo "$REPO" --body "${CARRIED_MARKER}
           ${ids_marker}
           **No content change since review round ${prior}.** Every commit on this branch carries a patch-id that round already reviewed, so this push — a rebase, or a force-push of identical content — ran no model round and does not consume ceiling budget.
@@ -306,6 +327,7 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REVIEW_FILE: ${{ inputs['review-file'] }}
           FOCUS: ${{ steps.guards.outputs.focus }}
+          IDS_MARKER: ${{ steps.guards.outputs.ids_marker }}
         run: |
           set -euo pipefail
           if [ ! -f "$REVIEW_FILE" ]; then
@@ -321,6 +343,12 @@ jobs:
             if [ -n "$FOCUS" ]; then
               echo "$FOCUS"
             fi
+            if [ -n "$IDS_MARKER" ]; then
+              echo
+              echo "Make the LAST line of your top-level verdict comment exactly this, copied verbatim:"
+              echo "$IDS_MARKER"
+              echo "It is an HTML comment — invisible when rendered — recording which content this round reviewed, so that a later rebase of the same commits reuses this verdict instead of paying for another review. Do not alter, wrap, or explain it."
+            fi
             echo "__CLAUDE_REVIEW_PROMPT__"
           } >> "$GITHUB_OUTPUT"
 
@@ -334,11 +362,15 @@ jobs:
             --max-turns ${{ steps.guards.outputs.turns }}
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Read,Grep,Glob,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh api:*),Bash(cat:*),Bash(grep:*),Bash(rg:*),Bash(find:*),Bash(ls:*),Bash(wc:*),Bash(head:*),Bash(tail:*),Bash(awk:*),Bash(sed:*),Bash(jq:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git rev-parse:*),Bash(git status:*),Bash(git branch:*),Bash(git ls-files:*)"
 
-      # Anchor the next round's delta: append the patch-id multiset just
-      # reviewed to this round's verdict comment. Best-effort — a missing marker
-      # costs a full re-review next round, never a skipped one, so a failure
-      # here degrades to the pre-patch-id behaviour rather than waving content
-      # through unreviewed.
+      # Anchor the next round's delta. The reviewer is asked to end its verdict
+      # comment with the marker; this step checks and, if the line is missing,
+      # posts the marker itself. Creating a comment is all `pull-requests:
+      # write` allows — editing one needs `issues: write`, and a reusable
+      # workflow requesting more than its caller grants fails the run at
+      # startup, so the marker is never written by editing.
+      #
+      # Best-effort throughout: without a marker the next round re-reviews in
+      # full, which costs a round but never skips one.
       - name: Record reviewed patch-ids
         if: steps.guards.outputs.skip != 'true'
         env:
@@ -346,39 +378,24 @@ jobs:
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PRIOR_COMMENT_ID: ${{ steps.guards.outputs.prior_comment_id }}
+          IDS_MARKER: ${{ steps.guards.outputs.ids_marker }}
+          ROUND: ${{ steps.guards.outputs.round }}
         run: |
           set -uo pipefail
-          work="${RUNNER_TEMP:-/tmp}"
-          pairs="${work}/claude-review-patch-ids.tsv"
-          if [ ! -s "$pairs" ]; then
-            echo "::warning::No PR commits resolved; skipping patch-id recording."
+          if [ -z "$IDS_MARKER" ]; then
+            echo "::warning::No PR commits resolved; this round records no patch-ids and the next one re-reviews in full."
             exit 0
           fi
 
-          verdict_id=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate --jq '.[]' \
-            | jq -s --argjson prior "${PRIOR_COMMENT_ID:-0}" \
-                '[.[] | select(.user.login == "claude[bot]") | select(.id > $prior)] | last | .id // empty')
-          if [ -z "$verdict_id" ]; then
-            echo "::warning::This round posted no claude[bot] verdict comment, so the next delta has nothing to anchor on; the next round re-reviews in full."
+          recorded=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate --jq '.[]' \
+            | jq -s --argjson prior "${PRIOR_COMMENT_ID:-0}" --arg marker "$IDS_MARKER" \
+                '[.[] | select(.id > $prior) | select((.body // "") | contains($marker))] | length')
+          if [ "${recorded:-0}" -gt 0 ]; then
+            echo "Round ${ROUND} recorded its patch-ids on the verdict comment."
             exit 0
           fi
 
-          body=$(gh api "repos/${REPO}/issues/comments/${verdict_id}" --jq '.body')
-          case "$body" in
-            *'<!-- claude-review-patch-ids: '*)
-              echo "Verdict comment ${verdict_id} already carries a patch-id marker."
-              exit 0
-              ;;
-          esac
-
-          updated="${work}/claude-review-verdict-body.md"
-          {
-            printf '%s\n\n' "$body"
-            printf '<!-- claude-review-patch-ids: %s -->\n' "$(cut -f2 "$pairs" | paste -sd, -)"
-          } > "$updated"
-
-          if ! jq -n --rawfile body "$updated" '{body: $body}' \
-               | gh api --method PATCH "repos/${REPO}/issues/comments/${verdict_id}" \
-                   --input - --silent; then
-            echo "::warning::Could not append the patch-id marker to comment ${verdict_id}; the next round re-reviews in full."
+          if ! gh pr comment "$PR_NUMBER" --repo "$REPO" --body "${IDS_MARKER}
+          <sub>Review round ${ROUND} read the content above. A later rebase of these same commits reuses that verdict instead of re-reviewing.</sub>"; then
+            echo "::warning::Could not record this round's patch-ids; the next round re-reviews in full."
           fi
