@@ -1,0 +1,15 @@
+name: review
+on:
+  pull_request:
+    types: [synchronize]
+jobs:
+  review:
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    uses: ./.github/workflows/claude-review.yml
+    with:
+      collaborators-only: false
+      review-file: REVIEW.md
+    secrets: inherit
