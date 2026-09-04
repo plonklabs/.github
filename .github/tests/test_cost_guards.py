@@ -526,6 +526,75 @@ def test_human_comment_cannot_forge_a_carry_over():
 
 
 # --------------------------------------------------------------------------
+# A carried `findings` verdict stays countable: consumers count `Finding N`
+# headings, so all of them ride along. A carried `clean` verdict does not grow.
+# --------------------------------------------------------------------------
+def test_carried_findings_keep_their_headings():
+    case("carry-over: a findings verdict brings every Finding heading with it")
+    with tempfile.TemporaryDirectory() as tmp:
+        f = Fixture(tmp)
+        f._git("switch", "-q", "-c", "feature")
+        a = f.commit("a.txt", "alpha\n", "add alpha")
+        ids = f.patch_ids([a])
+        f.bot_verdict(
+            "Round 1 review.\n\n"
+            "**Finding 1 — unbounded poll loop**\n"
+            "The loop never terminates.\n\n"
+            "**Finding 2 — missing context assert**\n"
+            "Guard the destructive call.\n\n"
+            "**Finding 3 — stale comment**\n"
+            "It describes the old shape.\n\n"
+            "Nothing else. Compare with finding 2 above.\n\n"
+            "Verdict: findings",
+            ids=ids)
+
+        f._git("switch", "-q", "main")
+        f.commit("unrelated.txt", "upstream\n", "upstream work")
+        f._git("switch", "-q", "feature")
+        f._git("rebase", "-q", "main")
+        f.state["pr_commits"] = f.branch_commits()
+
+        proc, out = f.run("Cost guards")
+        check("guards exit 0", proc.returncode == 0, proc.stderr)
+        check("skip=true", out.get("skip") == "true", out)
+        check("carried verdict is findings", out.get("carried_verdict") == "findings", out)
+        body = f.posted[-1]["body"] if f.posted else ""
+        for n in (1, 2, 3):
+            check(f"heading {n} copied verbatim",
+                  f"**Finding {n} — " in body, body)
+        check("headings keep their order",
+              body.index("Finding 1") < body.index("Finding 2") < body.index("Finding 3"), body)
+        check("prose mentioning a finding is not copied",
+              "Compare with finding 2" not in body, body)
+        check("verdict line still closes the comment",
+              body.rstrip().endswith("Verdict: findings"), body)
+
+        # The consumer gate counts `Finding N` labels; the carried comment must
+        # yield the same count as the round it carries.
+        import re
+        labels = sorted({int(m) for m in re.findall(r"(?im)\bfinding\s+(\d+)\b", body)})
+        check("gate would count three findings", labels == [1, 2, 3], labels)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        f = Fixture(tmp)
+        f._git("switch", "-q", "-c", "feature")
+        a = f.commit("a.txt", "alpha\n", "add alpha")
+        ids = f.patch_ids([a])
+        f.bot_verdict("Round 1 review. No problems.\n\nVerdict: clean", ids=ids)
+        f._git("switch", "-q", "main")
+        f.commit("unrelated.txt", "upstream\n", "upstream work")
+        f._git("switch", "-q", "feature")
+        f._git("rebase", "-q", "main")
+        f.state["pr_commits"] = f.branch_commits()
+
+        proc, out = f.run("Cost guards")
+        body = f.posted[-1]["body"] if f.posted else ""
+        check("clean carry-over names no findings", "Finding" not in body, body)
+        check("clean carry-over ends at the verdict line",
+              body.rstrip().endswith("Verdict: clean"), body)
+
+
+# --------------------------------------------------------------------------
 # The round ceiling still counts model rounds only, and still keeps the check
 # red while bot threads are unresolved.
 # --------------------------------------------------------------------------
@@ -651,6 +720,7 @@ def main():
     test_no_marker_degrades_to_full_rereview()
     test_missing_verdict_line_blocks_carry_over()
     test_human_comment_cannot_forge_a_carry_over()
+    test_carried_findings_keep_their_headings()
     test_ceiling_counts_model_rounds_only()
     test_auto_merge_follows_the_verdict()
     print()

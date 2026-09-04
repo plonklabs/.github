@@ -226,13 +226,18 @@ jobs:
 
           # A verdict, though, may only come from the reviewer, or from a
           # carried-over comment repeating one verbatim — never from any other
-          # workflow that happens to run under the same bot identity.
-          verdicts="${work}/claude-review-verdict-bodies.txt"
+          # workflow that happens to run under the same bot identity. The newest
+          # such comment that states a verdict is the one this round inherits:
+          # both its verdict line and, below, its finding headings come from
+          # that single body, so the two can never be read off different rounds.
+          latest="${work}/claude-review-latest-verdict.txt"
           jq -r --arg carried "$CARRIED_MARKER" \
-            '.[] | select(.user.login == "claude[bot]"
-                          or (.user.login == "github-actions[bot]"
-                              and ((.body // "") | contains($carried))))
-                 | .body // ""' "$comments" > "$verdicts"
+            '[.[] | select(.user.login == "claude[bot]"
+                           or (.user.login == "github-actions[bot]"
+                               and ((.body // "") | contains($carried))))
+                  | .body // ""
+                  | select(test("(^|\\n)[ \\t>*_]*verdict:[ \\t*_]*(clean|findings)\\b"; "i"))]
+             | last // ""' "$comments" > "$latest"
 
           # Highest comment id seen before this round. Comment ids increase
           # monotonically, so the recording step can identify what this round
@@ -266,7 +271,15 @@ jobs:
             | tr ',' '\n' | sed '/^$/d' | sort > "$recorded" || true
 
           prev_state=$(sed -nE 's/^[[:blank:]>*_]*[Vv]erdict:[[:blank:]*_]*([Cc]lean|[Ff]indings).*/\1/p' \
-            "$verdicts" | tail -1 | tr '[:upper:]' '[:lower:]')
+            "$latest" | tail -1 | tr '[:upper:]' '[:lower:]')
+
+          # Consumers count findings by their `Finding N` headings, so a carried
+          # `findings` verdict that repeated only the verdict line would collapse
+          # N findings into one and clear with a single acknowledgement. The
+          # headings are copied verbatim, in the order the reviewer wrote them.
+          headings="${work}/claude-review-carried-findings.txt"
+          grep -E '^[[:blank:]>*_#-]*[Ff]inding[[:blank:]]+[0-9]+' "$latest" \
+            > "$headings" || : > "$headings"
 
           # A rebase that carries the same content yields the same multiset of
           # patch-ids. Comparing multisets, rather than only asking whether
@@ -280,9 +293,19 @@ jobs:
             # Re-record the set so a chain of rebases keeps its anchor, and
             # repeat the previous round's `Verdict:` line so consumer merge
             # gates that read a verdict at head still find one.
-            gh pr comment "$PR_NUMBER" --repo "$REPO" --body "${CARRIED_MARKER}
+            carried_body="${CARRIED_MARKER}
           ${ids_marker}
-          **No content change since review round ${prior}.** Every commit on this branch carries a patch-id that round already reviewed, so this push — a rebase, or a force-push of identical content — ran no model round and does not consume ceiling budget.
+          **No content change since review round ${prior}.** Every commit on this branch carries a patch-id that round already reviewed, so this push — a rebase, or a force-push of identical content — ran no model round and does not consume ceiling budget."
+
+            if [ "$prev_state" = "findings" ] && [ -s "$headings" ]; then
+              carried_body="${carried_body}
+
+          Findings from round ${prior}, carried over unchanged:
+
+          $(cat "$headings")"
+            fi
+
+            gh pr comment "$PR_NUMBER" --repo "$REPO" --body "${carried_body}
 
           Verdict: ${prev_state}"
             echo "::notice::Content unchanged since round ${prior}; verdict carried over without a model round."
