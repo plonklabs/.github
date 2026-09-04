@@ -1,0 +1,27 @@
+name: tests
+
+# This repo's own gate. The `claude-review` cost guards are shell embedded in a
+# reusable workflow — a reusable workflow checks out the CALLER's repo, so the
+# guards cannot live in a script file here. The test extracts each step's
+# `run:` block from the YAML and runs it against a real git repository, so a
+# guard edit that breaks the rebase-stability contract fails here.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  cost-guards:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tool versions
+        run: |
+          yq --version
+          jq --version
+          git --version
+      - name: Cost-guard contract tests
+        run: python3 .github/tests/test_cost_guards.py

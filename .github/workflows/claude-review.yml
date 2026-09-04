@@ -57,14 +57,15 @@ on:
           open threads: all resolved -> green (merge is a human decision);
           any unresolved -> red, until each is fixed or declined-with-
           reasoning and its thread resolved. The ceiling caps spend, never
-          standards.
+          standards. Pushes that change no content are not rounds and do not
+          consume ceiling budget.
         type: number
         default: 5
       rereview-max-turns:
         description: >-
           Turn budget for re-review rounds (round 2+). Re-reviews focus on
-          the delta since the last reviewed commit, so they need far fewer
-          turns than the first full pass.
+          the commits whose content the bot has not seen, so they need far
+          fewer turns than the first full pass.
         type: number
         default: 20
     secrets:
@@ -90,10 +91,21 @@ jobs:
           fetch-depth: 0
 
       # Cost guards: count prior bot rounds on this PR, enforce the round
-      # ceiling, and shrink the budget + focus the prompt for re-reviews.
-      # A ceiling skip exits green — the review check being non-blocking at
-      # the ceiling is the policy (merge-or-redesign is a human decision),
-      # and a red here would wrongly block that decision.
+      # ceiling, and decide whether this push needs a model round at all.
+      #
+      # The re-review delta is anchored on CONTENT, not on commit SHAs. Each
+      # round records `git patch-id --stable` for every non-merge commit of the
+      # PR in a hidden marker on that round's verdict comment. A rebase
+      # rewrites every SHA but preserves patch-ids, so:
+      #   - identical patch-id multiset -> no model round, verdict carries over
+      #   - multiset gained entries     -> review exactly the gained commits
+      #   - changed any other way (a commit dropped, or no marker recorded yet)
+      #                                 -> generic re-review of the push
+      #
+      # Both skip paths (ceiling, carried-over verdict) exit green. The review
+      # check being non-blocking there is the policy: at the ceiling the
+      # merge-or-redesign call is human, and a carried-over verdict is one that
+      # already passed at content the bot has read.
       - name: Cost guards
         id: guards
         env:
@@ -105,85 +117,180 @@ jobs:
           REREVIEW_TURNS: ${{ inputs['rereview-max-turns'] }}
         run: |
           set -euo pipefail
-          MARKER='<!-- claude-review-round-ceiling -->'
+          CEILING_MARKER='<!-- claude-review-round-ceiling -->'
+          CARRIED_MARKER='<!-- claude-review-carried-over -->'
+          IDS_PREFIX='<!-- claude-review-patch-ids: '
 
-          # One round == one top-level verdict comment from the bot.
-          comments=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
-            --jq '[.[] | select(.user.login == "claude[bot]")] | length')
-          round=$((comments + 1))
+          work="${RUNNER_TEMP:-/tmp}"
+          comments="${work}/claude-review-comments.json"
+          pairs="${work}/claude-review-patch-ids.tsv"
+
+          # One fetch, reassembled locally: `--paginate` with an aggregating
+          # `--jq` runs the filter once per page and concatenates the results,
+          # so a `| length` there yields one number per page rather than a
+          # total. Streaming the elements and slurping them back gives a single
+          # array whatever the page count.
+          gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate --jq '.[]' \
+            | jq -s '.' > "$comments"
+
+          # One round == one top-level verdict comment from the bot. Carried-
+          # over verdicts are excluded explicitly, so the count stays a count of
+          # model rounds regardless of which identity posts them.
+          prior=$(jq --arg carried "$CARRIED_MARKER" \
+            '[.[] | select(.user.login == "claude[bot]")
+                  | select((.body // "") | contains($carried) | not)] | length' "$comments")
+          round=$((prior + 1))
           echo "round=${round}" >> "$GITHUB_OUTPUT"
 
           if [ "$round" -gt "$MAX_ROUNDS" ]; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "turns=0" >> "$GITHUB_OUTPUT"
+            {
+              echo "skip=true"
+              echo "turns=0"
+            } >> "$GITHUB_OUTPUT"
 
-            # The ceiling caps SPEND, not STANDARDS: no more model rounds,
-            # but unresolved bot threads (= unanswered findings) keep the
-            # check red until each is fixed or declined-with-reasoning and
-            # its thread resolved.
+            # The ceiling caps SPEND, not STANDARDS: no more model rounds, but
+            # unresolved bot threads (= unanswered findings) keep the check red
+            # until each is fixed or declined-with-reasoning and its thread
+            # resolved.
             owner="${REPO%%/*}"; name="${REPO##*/}"
             unresolved=$(gh api graphql \
               -f query='query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name){pullRequest(number:$pr){reviewThreads(first:100){nodes{isResolved comments(first:1){nodes{author{login}}}}}}}}' \
               -F owner="$owner" -F name="$name" -F pr="$PR_NUMBER" \
               --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false) | select(.comments.nodes[0].author.login | test("claude"))] | length')
 
-            already=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
-              --jq "[.[] | select(.body | contains(\"${MARKER}\"))] | length")
+            already=$(jq --arg m "$CEILING_MARKER" \
+              '[.[] | select((.body // "") | contains($m))] | length' "$comments")
             if [ "$unresolved" -gt 0 ]; then
               if [ "$already" -eq 0 ]; then
-                gh pr comment "$PR_NUMBER" --repo "$REPO" --body "${MARKER}
+                gh pr comment "$PR_NUMBER" --repo "$REPO" --body "${CEILING_MARKER}
           **Review round ceiling reached (${MAX_ROUNDS} rounds) with ${unresolved} unresolved review thread(s).** No further automated rounds will run. This check stays failing until every open bot thread is either fixed or declined with reasoning and its thread resolved — then re-run this check. If the findings indicate a design problem, redesign instead of iterating."
               fi
               echo "::error::Round ceiling reached with ${unresolved} unresolved bot review thread(s) — resolve (fix or reasoned-decline) each thread, then re-run this check."
               exit 1
             fi
             if [ "$already" -eq 0 ]; then
-              gh pr comment "$PR_NUMBER" --repo "$REPO" --body "${MARKER}
+              gh pr comment "$PR_NUMBER" --repo "$REPO" --body "${CEILING_MARKER}
           **Review round ceiling reached (${MAX_ROUNDS} rounds); all bot threads resolved.** Automated review stops here — the merge decision is now human."
             fi
             exit 0
           fi
-          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+          # The PR's own non-merge commits, oldest first. Sourced from the API
+          # rather than from git ancestry: on a `pull_request` event the
+          # checkout is `refs/pull/N/merge`, so HEAD carries the base branch's
+          # tip as a parent. A `<sha>..HEAD` range therefore contains every
+          # base-branch commit landed since the branch point, and the "delta"
+          # grows with the base branch's traffic rather than with what the
+          # author wrote. The API's commit list excludes anything reachable
+          # from the base, so it is bounded by the PR's own size no matter what
+          # lands upstream.
+          shas="${work}/claude-review-pr-shas.txt"
+          gh api "repos/${REPO}/pulls/${PR_NUMBER}/commits" --paginate \
+            --jq '.[] | select(.parents | length == 1) | .sha' > "$shas"
+
+          # `refs/pull/N/merge` has the PR head as a parent, so a full-depth
+          # checkout already carries every PR commit. The fetch below only
+          # covers a checkout that resolved to something else — an unmergeable
+          # PR has no merge ref.
+          need_fetch=""
+          while read -r sha; do
+            if ! git cat-file -e "${sha}^{commit}" 2>/dev/null; then need_fetch=1; fi
+          done < "$shas"
+          if [ -n "$need_fetch" ]; then
+            git fetch --no-tags --quiet origin \
+              "+refs/pull/${PR_NUMBER}/head:refs/remotes/pull/${PR_NUMBER}/head" 2>/dev/null || true
+          fi
+
+          # `<sha>\t<patch-id>` per commit, in PR order. `git patch-id`
+          # normalises away line numbers and whitespace, so the id tracks the
+          # change's content across a rebase. An empty commit produces no diff
+          # and therefore no id; it takes a constant token, which is likewise
+          # rebase-stable.
+          : > "$pairs"
+          while read -r sha; do
+            if ! id=$(git diff-tree --no-commit-id --patch -r --no-color "$sha" \
+                        | git patch-id --stable | awk 'NR == 1 { print $1 }'); then
+              id=""
+            fi
+            printf '%s\t%s\n' "$sha" "${id:-empty}" >> "$pairs"
+          done < "$shas"
+
+          # The bot's own comments plus any carried-over verdict this workflow
+          # posted: the only bodies allowed to supply a recorded patch-id set or
+          # a verdict line. A human quoting either must not steer the gate.
+          bodies="${work}/claude-review-verdict-bodies.txt"
+          jq -r --arg carried "$CARRIED_MARKER" \
+            '.[] | select(.user.login == "claude[bot]" or ((.body // "") | contains($carried)))
+                 | .body // ""' "$comments" > "$bodies"
+
+          # Highest bot comment id seen before this round. Comment ids increase
+          # monotonically, so the recording step can identify this round's
+          # verdict without depending on runner-vs-server clock agreement.
+          prior_comment_id=$(jq '[.[] | select(.user.login == "claude[bot]") | .id] | max // 0' "$comments")
+          echo "prior_comment_id=${prior_comment_id}" >> "$GITHUB_OUTPUT"
 
           if [ "$round" -eq 1 ]; then
-            echo "turns=${FULL_TURNS}" >> "$GITHUB_OUTPUT"
-            echo "focus=" >> "$GITHUB_OUTPUT"
+            {
+              echo "skip=false"
+              echo "turns=${FULL_TURNS}"
+              echo "focus="
+            } >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # Re-review: focus on the delta since the last commit the bot
-          # left inline comments on (best-effort — inline review comments
-          # carry commit_id; top-level verdicts do not).
-          last_sha=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/comments" --paginate \
-            --jq '[.[] | select(.user.login == "claude[bot]")] | last | .commit_id // empty' || true)
-          echo "turns=${REREVIEW_TURNS}" >> "$GITHUB_OUTPUT"
+          recorded="${work}/claude-review-recorded-ids.txt"
+          grep -o "${IDS_PREFIX}[0-9a-z,]* -->" "$bodies" | tail -1 \
+            | sed "s|^${IDS_PREFIX}||; s| -->\$||" \
+            | tr ',' '\n' | sed '/^$/d' | sort > "$recorded" || true
 
-          # The PR's own non-merge commits, oldest first. Sourced from
-          # the API rather than from git ancestry: on a `pull_request`
-          # event the checkout is `refs/pull/N/merge`, so HEAD carries
-          # the base branch's tip as a parent. A `<reviewed-sha>..HEAD`
-          # range therefore contains every base-branch commit landed
-          # since the branch point, and the "delta" grows with the base
-          # branch's traffic rather than with what the author wrote.
-          # The API's commit list excludes anything reachable from the
-          # base, so it is bounded by the PR's own size no matter what
-          # lands upstream.
-          pr_shas=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/commits" --paginate \
-            --jq '.[] | select(.parents | length == 1) | .sha' || true)
-          new_commits=""
-          if [ -n "$last_sha" ]; then
-            new_commits=$(printf '%s\n' "$pr_shas" \
-              | awk -v s="$last_sha" 'seen { print } $0 == s { seen = 1 }')
+          prev_state=$(sed -nE 's/^[[:blank:]>*_]*[Vv]erdict:[[:blank:]*_]*([Cc]lean|[Ff]indings).*/\1/p' \
+            "$bodies" | tail -1 | tr '[:upper:]' '[:lower:]')
+
+          # A rebase that carries the same content yields the same multiset of
+          # patch-ids. Comparing multisets, rather than only asking whether
+          # anything is new, also catches a rebase that DROPS a commit: content
+          # changed, so a round is owed even though nothing was added.
+          current_ids=$(cut -f2 "$pairs" | sort | tr '\n' ' ')
+          recorded_ids=$(tr '\n' ' ' < "$recorded")
+
+          if [ -s "$pairs" ] && [ -s "$recorded" ] && [ -n "$prev_state" ] \
+             && [ "$current_ids" = "$recorded_ids" ]; then
+            # Re-record the set so a chain of rebases keeps its anchor, and
+            # repeat the previous round's `Verdict:` line so consumer merge
+            # gates that read a verdict at head still find one.
+            ids_marker="${IDS_PREFIX}$(cut -f2 "$pairs" | paste -sd, -) -->"
+            gh pr comment "$PR_NUMBER" --repo "$REPO" --body "${CARRIED_MARKER}
+          ${ids_marker}
+          **No content change since review round ${prior}.** Every commit on this branch carries a patch-id that round already reviewed, so this push — a rebase, or a force-push of identical content — ran no model round and does not consume ceiling budget.
+
+          Verdict: ${prev_state}"
+            echo "::notice::Content unchanged since round ${prior}; verdict carried over without a model round."
+            {
+              echo "skip=true"
+              echo "turns=0"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+
+          new_commits="${work}/claude-review-new-commits.txt"
+          : > "$new_commits"
+          if [ -s "$recorded" ]; then
+            while IFS="$(printf '\t')" read -r sha id; do
+              grep -qxF "$id" "$recorded" || printf '  %s\n' "$sha" >> "$new_commits"
+            done < "$pairs"
+          fi
+
           {
+            echo "skip=false"
+            echo "turns=${REREVIEW_TURNS}"
             echo "focus<<__CLAUDE_REVIEW_FOCUS__"
             echo
             echo "RE-REVIEW, ROUND ${round}. You have already reviewed this PR."
-            if [ -n "$new_commits" ]; then
+            if [ -s "$new_commits" ]; then
               echo "The PR's own new commits since your last review are, oldest first:"
-              echo "$new_commits" | sed 's/^/  /'
+              cat "$new_commits"
               echo "Review ONLY what those commits changed — inspect them with \`git show <sha>\`."
-              echo "Do NOT review a \`${last_sha}..HEAD\` range. If this branch was updated from its base branch, that range also contains the base branch's commits, which are not this PR's work."
+              echo "Do NOT review a commit range ending at HEAD: this branch may have been rebased or updated from its base, so such a range also contains the base branch's commits, which are not this PR's work."
             else
               echo "Review ONLY the changes pushed since your previous review. \`gh pr diff\` gives this PR's diff against its base; focus on its newest commits."
             fi
@@ -226,3 +333,52 @@ jobs:
             --model ${{ inputs.model }}
             --max-turns ${{ steps.guards.outputs.turns }}
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Read,Grep,Glob,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh api:*),Bash(cat:*),Bash(grep:*),Bash(rg:*),Bash(find:*),Bash(ls:*),Bash(wc:*),Bash(head:*),Bash(tail:*),Bash(awk:*),Bash(sed:*),Bash(jq:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git rev-parse:*),Bash(git status:*),Bash(git branch:*),Bash(git ls-files:*)"
+
+      # Anchor the next round's delta: append the patch-id multiset just
+      # reviewed to this round's verdict comment. Best-effort — a missing marker
+      # costs a full re-review next round, never a skipped one, so a failure
+      # here degrades to the pre-patch-id behaviour rather than waving content
+      # through unreviewed.
+      - name: Record reviewed patch-ids
+        if: steps.guards.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PRIOR_COMMENT_ID: ${{ steps.guards.outputs.prior_comment_id }}
+        run: |
+          set -uo pipefail
+          work="${RUNNER_TEMP:-/tmp}"
+          pairs="${work}/claude-review-patch-ids.tsv"
+          if [ ! -s "$pairs" ]; then
+            echo "::warning::No PR commits resolved; skipping patch-id recording."
+            exit 0
+          fi
+
+          verdict_id=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate --jq '.[]' \
+            | jq -s --argjson prior "${PRIOR_COMMENT_ID:-0}" \
+                '[.[] | select(.user.login == "claude[bot]") | select(.id > $prior)] | last | .id // empty')
+          if [ -z "$verdict_id" ]; then
+            echo "::warning::This round posted no claude[bot] verdict comment, so the next delta has nothing to anchor on; the next round re-reviews in full."
+            exit 0
+          fi
+
+          body=$(gh api "repos/${REPO}/issues/comments/${verdict_id}" --jq '.body')
+          case "$body" in
+            *'<!-- claude-review-patch-ids: '*)
+              echo "Verdict comment ${verdict_id} already carries a patch-id marker."
+              exit 0
+              ;;
+          esac
+
+          updated="${work}/claude-review-verdict-body.md"
+          {
+            printf '%s\n\n' "$body"
+            printf '<!-- claude-review-patch-ids: %s -->\n' "$(cut -f2 "$pairs" | paste -sd, -)"
+          } > "$updated"
+
+          if ! jq -n --rawfile body "$updated" '{body: $body}' \
+               | gh api --method PATCH "repos/${REPO}/issues/comments/${verdict_id}" \
+                   --input - --silent; then
+            echo "::warning::Could not append the patch-id marker to comment ${verdict_id}; the next round re-reviews in full."
+          fi

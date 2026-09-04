@@ -63,7 +63,13 @@ jobs:
     secrets: inherit
 ```
 
-Inputs: `runs-on` (default `ubuntu-latest`), `model` (default `claude-sonnet-4-6`), `max-turns` (default `50`), `collaborators-only` (default `true`), `review-file` (default `REVIEW.md`). Secret: `CLAUDE_CODE_OAUTH_TOKEN`.
+Inputs: `runs-on` (default `ubuntu-latest`), `model` (default `claude-sonnet-4-6`), `max-turns` (default `50`), `collaborators-only` (default `true`), `review-file` (default `REVIEW.md`), `max-rounds` (default `5`), `rereview-max-turns` (default `20`). Secret: `CLAUDE_CODE_OAUTH_TOKEN`.
+
+**Rounds are counted in content, not pushes.** Each round records `git patch-id` for every commit of the PR in a hidden marker on that round's verdict comment. A rebase rewrites every SHA but preserves patch-ids, so a force-push that changes nothing runs no model round, does not advance the round counter toward `max-rounds`, and posts a short carried-over comment repeating the previous round's `Verdict:` line. A rebase that also adds a commit is re-reviewed as exactly that commit.
+
+> Consumer merge gates that tie a verdict to the head SHA must accept the carried-over comment: it is posted by the workflow's own token (`github-actions[bot]`), not by `claude[bot]`, and carries the `<!-- claude-review-carried-over -->` marker.
+
+The guards are covered by `.github/tests/test_cost_guards.py`, run by the `tests` workflow.
 
 ## Claude skills
 
