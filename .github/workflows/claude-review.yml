@@ -33,11 +33,15 @@ on:
       model:
         description: Model passed to claude-code-action.
         type: string
-        default: claude-sonnet-4-6
+        default: claude-sonnet-5
       max-turns:
-        description: Turn budget for the review session.
+        description: >-
+          Turn budget for the review session. The action counts one turn
+          per tool result, not per API round, so parallel tool calls spend
+          it several times faster than the model's own round count; the
+          budget is sized for that, and timeout-minutes is the real cap.
         type: number
-        default: 50
+        default: 200
       collaborators-only:
         description: >-
           When true, only run for PRs whose author has repo access
@@ -65,9 +69,10 @@ on:
         description: >-
           Turn budget for re-review rounds (round 2+). Re-reviews focus on
           the commits whose content the bot has not seen, so they need far
-          fewer turns than the first full pass.
+          fewer turns than the first full pass, but the same per-tool-result
+          counting applies, and a round that runs out writes no verdict.
         type: number
-        default: 20
+        default: 200
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN:
         required: true
