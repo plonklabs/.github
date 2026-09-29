@@ -208,9 +208,18 @@ jobs:
           # change's content across a rebase. An empty commit produces no diff
           # and therefore no id; it takes a constant token, which is likewise
           # rebase-stable.
+          #
+          # `--full-index` because the id has to be reproducible outside this
+          # runner: git abbreviates an object name to a length it takes from
+          # how many objects the clone holds, and while `patch-id` skips the
+          # `index` line wherever hunks follow it, a file the repository's
+          # attributes mark `-diff` has no hunks — its whole patch is that
+          # line. Without the pin, a commit touching one gets an id that is a
+          # property of this checkout rather than of the commit, and whoever
+          # reads the marker back never arrives at it.
           : > "$pairs"
           while read -r sha; do
-            if ! id=$(git diff-tree --no-commit-id --patch -r --no-color "$sha" \
+            if ! id=$(git diff-tree --no-commit-id --patch -r --no-color --full-index "$sha" \
                         | git patch-id --stable | awk 'NR == 1 { print $1 }'); then
               id=""
             fi
