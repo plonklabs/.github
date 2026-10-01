@@ -337,6 +337,7 @@ jobs:
           {
             echo "skip=false"
             echo "turns=${REREVIEW_TURNS}"
+            echo "delta_shas=$(awk '{ print $1 }' "$new_commits" | paste -sd' ' -)"
             echo "focus<<__CLAUDE_REVIEW_FOCUS__"
             echo
             echo "RE-REVIEW, ROUND ${round}. You have already reviewed this PR."
@@ -356,10 +357,12 @@ jobs:
         id: compose
         if: steps.guards.outputs.skip != 'true'
         env:
+          GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REVIEW_FILE: ${{ inputs['review-file'] }}
           FOCUS: ${{ steps.guards.outputs.focus }}
+          DELTA_SHAS: ${{ steps.guards.outputs.delta_shas }}
           IDS_MARKER: ${{ steps.guards.outputs.ids_marker }}
         run: |
           set -euo pipefail
@@ -367,12 +370,66 @@ jobs:
             echo "::error::Review instructions '$REVIEW_FILE' not found at the repository root. Add it, or set the review-file input on the caller."
             exit 1
           fi
+
+          # The content under review travels in the prompt, so the reviewer
+          # reads it at once instead of spending a turn per file fetching it.
+          # A re-review that names its new commits gets exactly those commits;
+          # every other round gets the PR's diff against its base. The file is
+          # where the diff lives whatever its size, outside the checkout so
+          # the reviewer's `git status` and `git diff` there stay clean.
+          if [ -n "${RUNNER_TEMP:-}" ]; then
+            review_dir="${RUNNER_TEMP}/review"
+          else
+            review_dir="$(mktemp -d)/review"
+          fi
+          diff="${review_dir}/diff.patch"
+          mkdir -p "$review_dir"
+          if [ -n "${DELTA_SHAS:-}" ]; then
+            read -ra delta <<< "$DELTA_SHAS"
+            git show --no-color --format=fuller "${delta[@]}" > "$diff" || rm -f "$diff"
+          else
+            gh pr diff "$PR_NUMBER" --repo "$REPO" --color=never > "$diff" || rm -f "$diff"
+          fi
+          diff_bytes=0
+          if [ -s "$diff" ]; then
+            diff_bytes=$(wc -c < "$diff")
+          else
+            rm -f "$diff"
+          fi
+
+          # The prompt reaches the action as a single environment variable,
+          # and Linux refuses to start a process when one environment string
+          # exceeds 128 KiB. The cap keeps the inline diff under that with
+          # room left for the review instructions; past it the prompt carries
+          # the diffstat and points at the file.
+          max_diff_bytes=100000
+
+          # A delimiter no attached content can contain: GitHub ends the
+          # multi-line value at the first line equal to it.
+          eof="__CLAUDE_REVIEW_PROMPT_$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')__"
           {
-            echo "prompt<<__CLAUDE_REVIEW_PROMPT__"
+            echo "prompt<<${eof}"
             echo "REPO: ${REPO}"
             echo "PR NUMBER: ${PR_NUMBER}"
             echo
             cat "$REVIEW_FILE"
+            echo
+            echo "## The diff under review (attached; read files only for context beyond it)"
+            echo
+            if [ "$diff_bytes" -eq 0 ]; then
+              echo "The diff could not be fetched, so no diff file was written. Read the changed files individually."
+            elif [ "$diff_bytes" -gt "$max_diff_bytes" ]; then
+              echo "The full diff (${diff_bytes} bytes) is too large to attach inline; its diffstat follows. The whole diff is in this file: ${diff} — Read it before opening any source file; open a source file only for context the diff does not show."
+              echo
+              echo '```'
+              git apply --stat < "$diff" || true
+              echo '```'
+            else
+              echo '```diff'
+              cat "$diff"
+              echo
+              echo '```'
+            fi
             if [ -n "$FOCUS" ]; then
               echo "$FOCUS"
             fi
@@ -382,13 +439,19 @@ jobs:
               echo "$IDS_MARKER"
               echo "It is an HTML comment — invisible when rendered — recording which content this round reviewed, so that a later rebase of the same commits reuses this verdict instead of paying for another review. Do not alter, wrap, or explain it."
             fi
-            echo "__CLAUDE_REVIEW_PROMPT__"
+            echo "${eof}"
           } >> "$GITHUB_OUTPUT"
 
+      # `show_full_output` is the action's only switch for the per-turn log:
+      # without it the action prints the init and result events and drops
+      # every assistant, tool-call and tool-result event in between. The log
+      # then carries tool output verbatim, which is readable by whoever can
+      # read the calling repository's Actions logs.
       - uses: anthropics/claude-code-action@9c5ddab2e6d17b83ea679153b31f1d5f023cf636 # v1.0.217
         if: steps.guards.outputs.skip != 'true'
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          show_full_output: true
           prompt: ${{ steps.compose.outputs.prompt }}
           claude_args: >-
             --model ${{ inputs.model }}
