@@ -74,6 +74,13 @@ if argv[0] == "pr" and argv[1] == "comment":
     save(state)
     sys.exit(0)
 
+if argv[0] == "pr" and argv[1] == "diff":
+    if "pr_diff" not in state:
+        sys.stderr.write("gh stub: no diff available\n")
+        sys.exit(1)
+    sys.stdout.write(state["pr_diff"])
+    sys.exit(0)
+
 if argv[0] != "api":
     sys.stderr.write("gh stub: unsupported command %r\n" % argv)
     sys.exit(2)
@@ -616,6 +623,81 @@ def test_ceiling_counts_model_rounds_only():
         check("unresolved bot thread keeps the check red", proc2.returncode == 1, proc2.stdout)
 
 
+# --------------------------------------------------------------------------
+# The prompt carries the content under review. The diff always lands in a file
+# outside the checkout; it rides inline when it fits, and past the cap the
+# prompt carries the diffstat and points at the file.
+# --------------------------------------------------------------------------
+def compose(f, extra_env=None):
+    (f.repo / "REVIEW.md").write_text("Review this PR.\n")
+    env = {"REVIEW_FILE": "REVIEW.md", "FOCUS": "", "IDS_MARKER": "<!-- ids -->"}
+    env.update(extra_env or {})
+    return f.run("Compose review prompt", extra_env=env)
+
+
+def test_rereview_attaches_exactly_the_delta_commits():
+    case("diff: a re-review attaches exactly its new commits, inline")
+    with tempfile.TemporaryDirectory() as tmp:
+        f = Fixture(tmp)
+        f._git("switch", "-q", "-c", "feature")
+        a = f.commit("a.txt", "alpha\n", "add alpha")
+        b = f.commit("b.txt", "beta\n", "add beta")
+        c = f.commit("c.txt", "gamma\n", "add gamma")
+
+        comp, cout = compose(f, {"DELTA_SHAS": f"{b} {c}"})
+        prompt = cout.get("prompt", "")
+        check("compose exit 0", comp.returncode == 0, comp.stderr)
+        check("prompt carries both new commits",
+              f"commit {b}" in prompt and f"commit {c}" in prompt, prompt)
+        check("prompt omits the reviewed commit", f"commit {a}" not in prompt, prompt)
+        check("diff is inline", "```diff\n" in prompt and "+gamma" in prompt, prompt)
+        diff = f.runner_temp / "review" / "diff.patch"
+        check("diff file written outside the checkout", diff.is_file(), diff)
+        check("checkout stays clean of the diff",
+              "diff.patch" not in f._git("status", "--porcelain"), f._git("status"))
+
+
+def test_failed_diff_fetch_keeps_the_prompt_whole():
+    case("diff: a failed fetch says so and leaves the rest of the prompt intact")
+    with tempfile.TemporaryDirectory() as tmp:
+        f = Fixture(tmp)
+        comp, cout = compose(f)
+        prompt = cout.get("prompt", "")
+        check("compose exit 0", comp.returncode == 0, comp.stderr)
+        check("prompt says no diff file was written",
+              "no diff file was written" in prompt, prompt)
+        check("no diff file left behind",
+              not (f.runner_temp / "review" / "diff.patch").exists())
+        check("prompt carries the review file", "Review this PR." in prompt, prompt)
+        check("marker is still the last instruction",
+              prompt.rstrip().split("\n")[-2:-1] == ["<!-- ids -->"], prompt)
+
+
+def test_oversized_diff_points_at_the_file():
+    case("diff: past the cap the prompt carries the diffstat and points at the file")
+    with tempfile.TemporaryDirectory() as tmp:
+        f = Fixture(tmp)
+        f._git("switch", "-q", "-c", "feature")
+        f.commit("big.txt", "".join(f"line {n:06d} of a wide change\n" for n in range(5000)),
+                 "add big")
+        f.state["pr_diff"] = subprocess.run(["git", "diff", "main...feature"], cwd=f.repo,
+                                            capture_output=True, text=True, check=True).stdout
+        check("fixture diff exceeds the cap", len(f.state["pr_diff"]) > 100000,
+              len(f.state["pr_diff"]))
+
+        comp, cout = compose(f)
+        prompt = cout.get("prompt", "")
+        diff = f.runner_temp / "review" / "diff.patch"
+        check("compose exit 0", comp.returncode == 0, comp.stderr)
+        check("diff file holds the whole diff",
+              diff.is_file() and diff.read_text() == f.state["pr_diff"])
+        check("prompt names the file", f"The whole diff is in this file: {diff}" in prompt,
+              prompt)
+        check("prompt carries the diffstat", "big.txt | 5000 +" in prompt, prompt)
+        check("no inline diff", "```diff" not in prompt and "+line 000000" not in prompt,
+              prompt[:500])
+
+
 
 def main():
     for tool in ("yq", "jq", "git"):
@@ -631,6 +713,9 @@ def main():
     test_human_comment_cannot_forge_a_carry_over()
     test_carried_findings_keep_their_headings()
     test_ceiling_counts_model_rounds_only()
+    test_rereview_attaches_exactly_the_delta_commits()
+    test_failed_diff_fetch_keeps_the_prompt_whole()
+    test_oversized_diff_points_at_the_file()
     print()
     if FAILURES:
         print(f"{len(FAILURES)} check(s) failed:")
