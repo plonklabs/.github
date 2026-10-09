@@ -70,12 +70,13 @@ on:
         default: 20
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN:
-        required: true
+        required: false
 
 jobs:
   review:
     if: >-
       ${{ !github.event.pull_request.draft &&
+          github.event.pull_request.user.login != 'dependabot[bot]' &&
           (inputs['collaborators-only'] == false ||
            contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'),
                     github.event.pull_request.author_association)) }}
