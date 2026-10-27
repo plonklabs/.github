@@ -101,20 +101,30 @@ jobs:
       # when it does not. A rebase rewrites every SHA but preserves patch-ids,
       # so:
       #   - identical patch-id multiset -> no model round, verdict carries over
-      #   - multiset gained entries     -> review exactly the gained commits
+      #   - multiset gained entries     -> review exactly the gained commits,
+      #     unless every gained commit touches only lock files and nothing was
+      #     dropped: a lock file is generated, so the verdict carries over
       #   - changed any other way (a commit dropped, or no marker recorded yet)
       #                                 -> generic re-review of the push
       #
-      # Both skip paths (ceiling, carried-over verdict) exit green. The review
-      # check being non-blocking there is the policy: at the ceiling the
-      # merge-or-redesign call is human, and a carried-over verdict is one that
-      # already passed at content the bot has read.
+      # A pull request titled `chore(release): …` is a version bump the
+      # release tooling wrote, and runs no model round at any push.
+      #
+      # Every skip path (release bump, ceiling, carried-over verdict) skips the
+      # model steps, never the job: a caller that holds work until the review
+      # check reports reads a skipped job as a round still to come, and a
+      # completed one as a round that is over. The skips exit green, the
+      # ceiling with unresolved bot threads aside. The review check being
+      # non-blocking there is the policy: at the ceiling the merge-or-redesign
+      # call is human, and a carried-over verdict is one that already passed at
+      # content the bot has read.
       - name: Cost guards
         id: guards
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
           MAX_ROUNDS: ${{ inputs['max-rounds'] }}
           FULL_TURNS: ${{ inputs['max-turns'] }}
           REREVIEW_TURNS: ${{ inputs['rereview-max-turns'] }}
@@ -123,6 +133,19 @@ jobs:
           CEILING_MARKER='<!-- claude-review-round-ceiling -->'
           CARRIED_MARKER='<!-- claude-review-carried-over -->'
           IDS_PREFIX='<!-- claude-review-patch-ids: '
+
+          # The title is read from the environment, never interpolated into
+          # the script, so a title cannot inject shell.
+          case "${PR_TITLE:-}" in
+            "chore(release):"*)
+              echo "::notice::A release bump runs no model round."
+              {
+                echo "skip=true"
+                echo "turns=0"
+              } >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
 
           work="${RUNNER_TEMP:-/tmp}"
           comments="${work}/claude-review-comments.json"
@@ -298,14 +321,13 @@ jobs:
           current_ids=$(cut -f2 "$pairs" | sort | tr '\n' ' ')
           recorded_ids=$(tr '\n' ' ' < "$recorded")
 
-          if [ -s "$pairs" ] && [ -s "$recorded" ] && [ -n "$prev_state" ] \
-             && [ "$current_ids" = "$recorded_ids" ]; then
-            # Re-record the set so a chain of rebases keeps its anchor, and
-            # repeat the previous round's `Verdict:` line so consumer merge
-            # gates that read a verdict at head still find one.
-            carried_body="${CARRIED_MARKER}
+          # Re-records the set so a chain of skipped pushes keeps its anchor,
+          # and repeats the previous round's `Verdict:` line so consumer merge
+          # gates that read a verdict at head still find one.
+          carry_over() { # headline notice
+            local carried_body="${CARRIED_MARKER}
           ${ids_marker}
-          **No content change since review round ${prior}.** Every commit on this branch carries a patch-id that round already reviewed, so this push — a rebase, or a force-push of identical content — ran no model round and does not consume ceiling budget."
+          $1"
 
             if [ "$prev_state" = "findings" ] && [ -s "$headings" ]; then
               carried_body="${carried_body}
@@ -318,13 +340,19 @@ jobs:
             gh pr comment "$PR_NUMBER" --repo "$REPO" --body "${carried_body}
 
           Verdict: ${prev_state}"
-            echo "::notice::Content unchanged since round ${prior}; verdict carried over without a model round."
+            echo "::notice::$2"
             {
               echo "skip=true"
               echo "turns=0"
               echo "carried_verdict=${prev_state}"
             } >> "$GITHUB_OUTPUT"
             exit 0
+          }
+
+          if [ -s "$pairs" ] && [ -s "$recorded" ] && [ -n "$prev_state" ] \
+             && [ "$current_ids" = "$recorded_ids" ]; then
+            carry_over "**No content change since review round ${prior}.** Every commit on this branch carries a patch-id that round already reviewed, so this push — a rebase, or a force-push of identical content — ran no model round and does not consume ceiling budget." \
+              "Content unchanged since round ${prior}; verdict carried over without a model round."
           fi
 
           new_commits="${work}/claude-review-new-commits.txt"
@@ -333,6 +361,27 @@ jobs:
             while IFS="$(printf '\t')" read -r sha id; do
               grep -qxF "$id" "$recorded" || printf '  %s\n' "$sha" >> "$new_commits"
             done < "$pairs"
+          fi
+
+          # A lock file is generated from manifests the reviewer has already
+          # read, so a push whose gained commits touch nothing else carries the
+          # verdict over. Only when nothing reviewed was dropped: a dropped
+          # commit is a content change the gained ones do not describe.
+          if [ -s "$new_commits" ] && [ -n "$prev_state" ] \
+             && [ -z "$(cut -f2 "$pairs" | sort | comm -23 "$recorded" -)" ]; then
+            lock_only=1
+            while read -r sha; do
+              while read -r path; do
+                case "${path##*/}" in
+                  Cargo.lock | package-lock.json | pnpm-lock.yaml) ;;
+                  *) lock_only="" ;;
+                esac
+              done < <(git diff-tree --no-commit-id --name-only -r "$sha")
+            done < "$new_commits"
+            if [ -n "$lock_only" ]; then
+              carry_over "**Only lock files changed since review round ${prior}.** Every commit this push added touches \`Cargo.lock\`, \`package-lock.json\` or \`pnpm-lock.yaml\` and nothing else, so it ran no model round and does not consume ceiling budget." \
+                "Only lock files changed since round ${prior}; verdict carried over without a model round."
+            fi
           fi
 
           {
