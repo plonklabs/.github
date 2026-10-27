@@ -698,6 +698,114 @@ def test_oversized_diff_points_at_the_file():
               prompt[:500])
 
 
+# --------------------------------------------------------------------------
+# Mechanical pushes run no model round: a release bump at any push, and a push
+# whose added commits touch only lock files. A real change beside a lock file
+# is still reviewed.
+# --------------------------------------------------------------------------
+def test_release_bump_runs_no_round():
+    case("release bump: no model round, no comment, green")
+    with tempfile.TemporaryDirectory() as tmp:
+        f = Fixture(tmp)
+        f._git("switch", "-q", "-c", "release")
+        a = f.commit("Cargo.toml", "version = \"0.0.31\"\n", "bump")
+        f.state["pr_commits"] = [a]
+
+        proc, out = f.run("Cost guards", extra_env={"PR_TITLE": "chore(release): v0.0.31"})
+        check("guards exit 0", proc.returncode == 0, proc.stderr)
+        check("skip=true on round 1", out.get("skip") == "true", out)
+        check("zero turn budget", out.get("turns") == "0", out)
+        check("nothing posted", not f.posted, f.posted)
+        check("no API read at all", f.state.get("calls", []) == [], f.state.get("calls"))
+
+    case("a chore title that is not a release still reviews")
+    with tempfile.TemporaryDirectory() as tmp:
+        f = Fixture(tmp)
+        f._git("switch", "-q", "-c", "feature")
+        a = f.commit("a.txt", "alpha\n", "add alpha")
+        f.state["pr_commits"] = [a]
+
+        proc, out = f.run("Cost guards", extra_env={"PR_TITLE": "chore(deps): bump serde"})
+        check("skip=false", out.get("skip") == "false", out)
+
+
+def reviewed_branch(f):
+    """A branch with one reviewed commit and its round-1 verdict recorded."""
+    f._git("switch", "-q", "-c", "feature")
+    a = f.commit("a.txt", "alpha\n", "add alpha")
+    ids = f.patch_ids([a])
+    f.bot_verdict("Round 1 review.\n\nVerdict: clean", ids=ids)
+    return a
+
+
+def test_lock_only_push_carries_over():
+    case("lock-only push: no model round, verdict carried over, set re-recorded")
+    with tempfile.TemporaryDirectory() as tmp:
+        f = Fixture(tmp)
+        a = reviewed_branch(f)
+        (f.repo / "web").mkdir()
+        l1 = f.commit("Cargo.lock", "lock\n", "update Cargo.lock")
+        l2 = f.commit("web/pnpm-lock.yaml", "lock\n", "update pnpm lock")
+        l3 = f.commit("web/package-lock.json", "{}\n", "update npm lock")
+        f.state["pr_commits"] = [a, l1, l2, l3]
+
+        proc, out = f.run("Cost guards")
+        check("guards exit 0", proc.returncode == 0, proc.stderr)
+        check("skip=true", out.get("skip") == "true", out)
+        check("zero turn budget", out.get("turns") == "0", out)
+        body = f.posted[-1]["body"] if f.posted else ""
+        check("one carried-over comment", len(f.posted) == 1, f.posted)
+        check("carries the carried-over marker", body.startswith(CARRIED_MARKER), body)
+        check("says only lock files changed", "Only lock files changed" in body, body)
+        check("re-records the set with the lock commits",
+              IDS_PREFIX + ",".join(f.patch_ids([a, l1, l2, l3])) + " -->" in body, body)
+        check("repeats the prior verdict line", body.rstrip().endswith("Verdict: clean"), body)
+
+        # The next real change is reviewed as just that change.
+        b = f.commit("b.txt", "beta\n", "add beta")
+        f.state["pr_commits"] = [a, l1, l2, l3, b]
+        _, out2 = f.run("Cost guards")
+        check("a later real change reviews", out2.get("skip") == "false", out2)
+        check("round counter is 2", out2.get("round") == "2", out2)
+        listed = [ln.strip() for ln in out2.get("focus", "").split("\n")
+                  if ln.strip() and all(ch in "0123456789abcdef" for ch in ln.strip())]
+        check("delta is only the real change", listed == [b], listed)
+
+
+def test_real_change_beside_a_lock_file_reviews():
+    case("a lock file beside a real change: reviewed")
+    with tempfile.TemporaryDirectory() as tmp:
+        f = Fixture(tmp)
+        a = reviewed_branch(f)
+        l1 = f.commit("Cargo.lock", "lock\n", "update Cargo.lock")
+        (f.repo / "Cargo.toml").write_text("[dependencies]\n")
+        (f.repo / "Cargo.lock").write_text("lock 2\n")
+        f._git("add", "Cargo.toml", "Cargo.lock")
+        f._git("commit", "-q", "-m", "add a dependency")
+        b = f._git("rev-parse", "HEAD")
+        f.state["pr_commits"] = [a, l1, b]
+
+        proc, out = f.run("Cost guards")
+        check("guards exit 0", proc.returncode == 0, proc.stderr)
+        check("skip=false", out.get("skip") == "false", out)
+        check("no carried-over comment", not f.posted, f.posted)
+        check("focus names the real change", b in out.get("focus", ""), out.get("focus"))
+
+    case("lock-only additions after a dropped commit: reviewed")
+    with tempfile.TemporaryDirectory() as tmp:
+        f = Fixture(tmp)
+        f._git("switch", "-q", "-c", "feature")
+        a = f.commit("a.txt", "alpha\n", "add alpha")
+        b = f.commit("b.txt", "beta\n", "add beta")
+        f.bot_verdict("Round 1 review.\n\nVerdict: clean", ids=f.patch_ids([a, b]))
+        f._git("reset", "-q", "--hard", a)
+        l1 = f.commit("Cargo.lock", "lock\n", "update Cargo.lock")
+        f.state["pr_commits"] = [a, l1]
+
+        proc, out = f.run("Cost guards")
+        check("skip=false", out.get("skip") == "false", out)
+        check("no carried-over comment", not f.posted, f.posted)
+
 
 def main():
     for tool in ("yq", "jq", "git"):
@@ -716,6 +824,9 @@ def main():
     test_rereview_attaches_exactly_the_delta_commits()
     test_failed_diff_fetch_keeps_the_prompt_whole()
     test_oversized_diff_points_at_the_file()
+    test_release_bump_runs_no_round()
+    test_lock_only_push_carries_over()
+    test_real_change_beside_a_lock_file_reviews()
     print()
     if FAILURES:
         print(f"{len(FAILURES)} check(s) failed:")
